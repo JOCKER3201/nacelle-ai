@@ -116,6 +116,20 @@ fn main() -> ExitCode {
     let worker = match choice.backend.take() {
         Some(backend) => {
             let tools = Toolbox::from_env(&ProcessEnv);
+            // Said here and only here, which is once per run: the core
+            // is a library and does not print, and this is the one
+            // place the directories are built from the real
+            // environment. A machine from before the folder was named
+            // after the family says nothing at all.
+            for dir in tools.dirs().legacy_dirs_in_use() {
+                eprintln!(
+                    "nacelle-ai: reading {} \u{2014} the folder's old name. Nothing has \
+                     been moved and nothing has to be; its place from now on is {}, one \
+                     folder for the whole nacelle family",
+                    dir.display(),
+                    dir.with_file_name(nacelle_ai::tools::paths::APP).display()
+                );
+            }
             let agent = Agent::new(backend, Box::new(tools), choice.model.clone());
             match Worker::spawn(agent) {
                 Ok(pair) => Some(pair),

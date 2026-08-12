@@ -377,8 +377,8 @@ fn the_credential_stores_a_real_home_directory_has_are_all_refused() {
 #[test]
 fn the_tools_read_through_the_guard_and_not_around_it() {
     let root = scratch("toolbox");
-    let config = root.join("config").join("nacelle-desktop");
-    let data = root.join("data").join("nacelle-desktop");
+    let config = root.join("config").join("nacelle");
+    let data = root.join("data").join("nacelle");
     fs::create_dir_all(config.join("..")).expect("config");
     fs::create_dir_all(data.join("layauts")).expect("layauts");
     fs::write(

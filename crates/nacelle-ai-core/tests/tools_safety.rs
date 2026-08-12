@@ -28,7 +28,9 @@ use nacelle_ai::tools::{TOOL_READ_LAYAUT, TOOL_SET_CONFIG, TOOL_SET_LAYAUT, TOOL
 use nacelle_ai::{DesktopDirs, ToolError, Toolbox};
 use serde_json::json;
 
-const APP: &str = "nacelle-desktop";
+/// The family's folder. The configuration file keeps the program's
+/// name, which is why only one of these two reads "desktop".
+const APP: &str = "nacelle";
 const CONF: &str = "nacelle-desktop.conf";
 
 fn scratch(tag: &str) -> PathBuf {
