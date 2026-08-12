@@ -1,5 +1,5 @@
-//! Where nacelle-desktop keeps its configuration and its data, and the
-//! two rules that keep a tool inside those directories.
+//! Where the nacelle family keeps its configuration and its data, and
+//! the two rules that keep a tool inside those directories.
 //!
 //! The arrangement is the XDG one the desktop implements: exactly one
 //! directory is ever WRITTEN to, and a search path — most specific
@@ -7,11 +7,18 @@
 //! install shadows without anything being copied into a home directory.
 //!
 //! ```text
-//! $XDG_CONFIG_HOME/nacelle-desktop/            the user's own, and the only write target
-//! $XDG_CONFIG_DIRS/nacelle-desktop/            system defaults (/etc/xdg when unset)
-//! $XDG_DATA_HOME/nacelle-desktop/              layauts/, themes/, addons/, sounds/
-//! $XDG_DATA_DIRS/nacelle-desktop/              the installed ones
+//! $XDG_CONFIG_HOME/nacelle/            the user's own, and the only write target
+//! $XDG_CONFIG_DIRS/nacelle/            system defaults (/etc/xdg when unset)
+//! $XDG_DATA_HOME/nacelle/              layauts/, themes/, addons/, sounds/
+//! $XDG_DATA_DIRS/nacelle/              the installed ones
 //! ```
+//!
+//! Every one of those is followed on the read path by the same
+//! directory under the folder's old name, `nacelle-desktop` — see
+//! [`LEGACY_APP`]. This program is the reason the folder is named after
+//! the family at all: it reads the desktop's directories, and a folder
+//! named after one member of a family that shares it was an accident
+//! rather than a design.
 //!
 //! The directories are derived from an [`Env`] rather than from the
 //! process environment, so a test hands this a map and a throwaway
@@ -29,9 +36,17 @@ use std::path::{Component, Path, PathBuf};
 use crate::credentials::Env;
 use crate::tools::error::ToolError;
 
-/// The desktop's name — its directory under every XDG root.
-pub const APP: &str = "nacelle-desktop";
-/// The one configuration file, in every configuration directory.
+/// The family's name — its directory under every XDG root. The FOLDER
+/// is the family; the file inside it is the program.
+pub const APP: &str = "nacelle";
+/// What that directory was called when it was named after the desktop
+/// alone. Read, never written: a machine that has one keeps it, and
+/// everything installed there goes on being found one place further
+/// down the search path.
+pub const LEGACY_APP: &str = "nacelle-desktop";
+/// The one configuration file, in every configuration directory. Named
+/// after the PROGRAM whose settings it carries, which is why it does
+/// not change with the folder.
 pub const CONF_FILE: &str = "nacelle-desktop.conf";
 
 /// Layout files, `<name>.layaut`.
@@ -54,7 +69,7 @@ pub const ENV_THEME_DIR: &str = "NACELLE_THEME_DIR";
 /// The XDG defaults, spelled out so the fallbacks are visible.
 const DEFAULT_CONFIG_DIRS: &str = "/etc/xdg";
 const DEFAULT_DATA_DIRS: &str = "/usr/local/share:/usr/share";
-const SYSTEM_THEME_DIR: &str = "/usr/share/nacelle-desktop/themes";
+const SYSTEM_THEME_BASE: &str = "/usr/share";
 
 /// Every directory a tool may read from, and the one it may write to.
 #[derive(Clone, Debug)]
@@ -68,15 +83,18 @@ pub struct DesktopDirs {
 impl DesktopDirs {
     /// The directories the given environment describes.
     pub fn from_env(env: &dyn Env) -> Self {
-        let config_dir = home_based(env, ENV_XDG_CONFIG_HOME, ".config");
-        let data_dir = home_based(env, ENV_XDG_DATA_HOME, ".local/share");
+        let config_home = home_based(env, ENV_XDG_CONFIG_HOME, ".config");
+        let data_home = home_based(env, ENV_XDG_DATA_HOME, ".local/share");
+        // The write target is the family directory and nothing else:
+        // the old name is read, never written to.
+        let config_dir = config_home.as_ref().map(|base| base.join(APP));
         let config_dirs = search_path(
-            config_dir.clone(),
+            config_home.clone(),
             non_blank(env.var(ENV_XDG_CONFIG_DIRS)),
             DEFAULT_CONFIG_DIRS,
         );
         let data_dirs = search_path(
-            data_dir.clone(),
+            data_home.clone(),
             non_blank(env.var(ENV_XDG_DATA_DIRS)),
             DEFAULT_DATA_DIRS,
         );
@@ -86,14 +104,28 @@ impl DesktopDirs {
         // a fixed system directory rather than walking XDG_DATA_DIRS.
         // Mirrored rather than invented, so this lists the files the
         // desktop would really load.
+        //
+        // Both folder names are listed, newest first, for the same
+        // reason they are on the other two paths. Note that the toolkit
+        // itself still names ONLY the old folder in its theme lookup —
+        // that is a fourth repository and a change of its own — so
+        // today a `.theme` under the new name is listed here before the
+        // toolkit has learned to load it.
         let mut theme_dirs = Vec::new();
         if let Some(dir) = non_blank(env.var(ENV_THEME_DIR)) {
             theme_dirs.push(PathBuf::from(dir));
         }
-        for dir in [data_dir, config_dir.clone()].into_iter().flatten() {
-            push_unique(&mut theme_dirs, dir.join(THEMES_SUB));
+        for base in [data_home, config_home].into_iter().flatten() {
+            for name in [APP, LEGACY_APP] {
+                push_unique(&mut theme_dirs, base.join(name).join(THEMES_SUB));
+            }
         }
-        push_unique(&mut theme_dirs, PathBuf::from(SYSTEM_THEME_DIR));
+        for name in [APP, LEGACY_APP] {
+            push_unique(
+                &mut theme_dirs,
+                PathBuf::from(SYSTEM_THEME_BASE).join(name).join(THEMES_SUB),
+            );
+        }
         DesktopDirs {
             config_dir,
             config_dirs,
@@ -104,9 +136,14 @@ impl DesktopDirs {
 
     /// Build directories directly — for tests, and for an embedder that
     /// keeps the desktop somewhere of its own.
+    ///
+    /// These are the directories THEMSELVES: no family name is joined
+    /// on and no old name is paired with them, because a caller that
+    /// names its own directory has already said everything there is to
+    /// say about where it keeps things.
     pub fn new(config_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Self {
-        let config_dirs = search_path(config_dir.clone(), None, "");
-        let data_dirs = search_path(data_dir.clone(), None, "");
+        let config_dirs: Vec<PathBuf> = config_dir.clone().into_iter().collect();
+        let data_dirs: Vec<PathBuf> = data_dir.clone().into_iter().collect();
         let mut theme_dirs = Vec::new();
         for dir in [data_dir, config_dir.clone()].into_iter().flatten() {
             push_unique(&mut theme_dirs, dir.join(THEMES_SUB));
@@ -159,33 +196,67 @@ impl DesktopDirs {
     pub fn data_roots(&self) -> &[PathBuf] {
         &self.data_dirs
     }
+
+    /// The directories under the folder's OLD name that actually exist
+    /// — the ones a read can still land in.
+    ///
+    /// Empty on a machine that never ran the desktop before the rename,
+    /// which is why it is worth saying when it is not: this crate has
+    /// no logging of its own, so it hands the fact to whoever runs it
+    /// rather than printing from a library.
+    pub fn legacy_dirs_in_use(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for dir in self.config_dirs.iter().chain(self.data_dirs.iter()) {
+            if dir.file_name().and_then(|n| n.to_str()) == Some(LEGACY_APP) && dir.is_dir() {
+                push_unique(&mut out, dir.clone());
+            }
+        }
+        out
+    }
 }
 
-/// `$VAR/nacelle-desktop`, or `$HOME/<fallback>/nacelle-desktop`, or
-/// nothing at all when the environment names neither.
+/// `$VAR`, or `$HOME/<fallback>`, or nothing at all when the
+/// environment names neither. The BASE the family directory sits in —
+/// the search path needs it to build both names.
 fn home_based(env: &dyn Env, var: &str, fallback: &str) -> Option<PathBuf> {
-    let root = match non_blank(env.var(var)) {
-        Some(dir) => PathBuf::from(dir),
+    match non_blank(env.var(var)) {
+        Some(dir) => Some(PathBuf::from(dir)),
         None => {
             let mut home = PathBuf::from(non_blank(env.var(ENV_HOME))?);
             for part in fallback.split('/') {
                 home.push(part);
             }
-            home
+            Some(home)
         }
-    };
-    Some(root.join(APP))
+    }
 }
 
-/// The user's directory first, then each `:`-separated system base
-/// joined with the application name, duplicates dropped.
+/// The user's base first, then each `:`-separated system base, every
+/// one of them contributing `<base>/nacelle` and directly behind it
+/// `<base>/nacelle-desktop`, duplicates dropped.
+///
+/// The pair is kept together at every level rather than the old names
+/// being appended at the end: the configuration is merged key by key,
+/// so a user's file under the old name has to go on outranking the
+/// system defaults.
 fn search_path(user: Option<PathBuf>, system: Option<String>, default: &str) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = user.into_iter().collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for base in user.into_iter() {
+        push_level(&mut out, &base);
+    }
     let system = system.unwrap_or_else(|| default.to_string());
     for base in system.split(':').filter(|b| !b.is_empty()) {
-        push_unique(&mut out, PathBuf::from(base).join(APP));
+        push_level(&mut out, Path::new(base));
     }
     out
+}
+
+/// One level of a search path: the family directory, then the folder's
+/// old name.
+fn push_level(out: &mut Vec<PathBuf>, base: &Path) {
+    for name in [APP, LEGACY_APP] {
+        push_unique(out, base.join(name));
+    }
 }
 
 fn push_unique(list: &mut Vec<PathBuf>, dir: PathBuf) {

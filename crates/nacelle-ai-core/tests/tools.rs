@@ -1,19 +1,18 @@
 //! Every tool, on a throwaway installation.
 //!
-//! Each test builds a whole nacelle-desktop directory tree in a
-//! temporary directory and points a [`Toolbox`] at it. Nothing reads
-//! the process environment, nothing touches the developer's own
-//! `~/.config`, and no test depends on what happens to be installed on
-//! the machine running it — which matters here more than usual, since
-//! the machine running these tests may well have a real nacelle desktop
-//! on it.
+//! Each test builds a whole nacelle directory tree in a temporary
+//! directory and points a [`Toolbox`] at it. Nothing reads the process
+//! environment, nothing touches the developer's own `~/.config`, and no
+//! test depends on what happens to be installed on the machine running
+//! it — which matters here more than usual, since the machine running
+//! these tests may well have a real nacelle desktop on it.
 //!
 //! The directories are handed over explicitly rather than through
 //! `XDG_*` for the same reason: `DesktopDirs::from_env` adds the system
-//! search path, and `/usr/share/nacelle-desktop` existing or not would
-//! decide whether a listing test passed. The two tests that are ABOUT
-//! the search path build their own environment map, with every system
-//! directory pointed at a temporary one.
+//! search path, and `/usr/share/nacelle` existing or not would decide
+//! whether a listing test passed. The tests that are ABOUT the search
+//! path build their own environment map, with every system directory
+//! pointed at a temporary one.
 
 use std::collections::HashMap;
 use std::fs;
@@ -28,7 +27,12 @@ use nacelle_ai::tools::{
 use nacelle_ai::{Content, DesktopDirs, ToolError, Toolbox};
 use serde_json::{json, Value};
 
-const APP: &str = "nacelle-desktop";
+/// The family's folder, under every XDG root.
+const APP: &str = "nacelle";
+/// What that folder was called before. Read, never written.
+const LEGACY_APP: &str = "nacelle-desktop";
+/// The configuration file is named after the PROGRAM, so it did not
+/// change with the folder.
 const CONF: &str = "nacelle-desktop.conf";
 
 /// A fresh directory for one test. The counter keeps parallel tests
@@ -45,8 +49,8 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// One installation: `<root>/config/nacelle-desktop` and
-/// `<root>/data/nacelle-desktop`, both created.
+/// One installation: `<root>/config/nacelle` and `<root>/data/nacelle`,
+/// both created.
 struct Install {
     config: PathBuf,
     data: PathBuf,
@@ -615,6 +619,207 @@ fn the_first_data_root_holding_a_name_wins() {
     );
     let read = run(&tools, TOOL_READ_LAYAUT, json!({ "name": "wide" }));
     assert_eq!(read["text"], "MINE", "the user's copy shadows the system one");
+}
+
+/// An environment with every system directory pointed at a temporary
+/// one, so a test says nothing about the machine it runs on.
+fn env_at(root: &Path) -> HashMap<String, String> {
+    [
+        ("XDG_CONFIG_HOME", root.join("config").display().to_string()),
+        ("XDG_CONFIG_DIRS", root.join("etc").display().to_string()),
+        ("XDG_DATA_HOME", root.join("data").display().to_string()),
+        ("XDG_DATA_DIRS", root.join("share").display().to_string()),
+        ("NACELLE_THEME_DIR", root.join("themes").display().to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// The folder used to be named after the desktop alone. A machine that
+/// has one is READ, never moved: this is the case that covers every
+/// installation made before the rename.
+#[test]
+fn a_configuration_under_the_folders_old_name_is_still_read() {
+    let root = scratch("legacy-conf");
+    let old = root.join("config").join(LEGACY_APP);
+    fs::create_dir_all(&old).expect("old config directory");
+    fs::write(old.join(CONF), "Theme=crimson\nSoundVolume=20\n").expect("conf");
+
+    let out = run(&Toolbox::from_env(&env_at(&root)), TOOL_READ_CONFIG, json!({}));
+    let settings = out["settings"].as_array().expect("an array");
+    let theme = settings.iter().find(|s| s["key"] == "Theme").expect("Theme");
+    assert_eq!(theme["value"], "crimson");
+    assert_eq!(
+        theme["from"],
+        old.join(CONF).display().to_string(),
+        "the value must be reported from the file it really came from"
+    );
+}
+
+/// With both folders in place the new one wins key by key, and a key
+/// only the old file carries is still inherited — one cascade, the two
+/// names one rung apart.
+#[test]
+fn the_new_folder_wins_over_the_old_one_and_both_over_the_system() {
+    let root = scratch("both-conf");
+    let new = root.join("config").join(APP);
+    let old = root.join("config").join(LEGACY_APP);
+    let system = root.join("etc").join(APP);
+    for dir in [&new, &old, &system] {
+        fs::create_dir_all(dir).expect("directory");
+    }
+    fs::write(system.join(CONF), "Theme=lockdown\nLayaut=lockdown\nSoundVolume=5\n")
+        .expect("system conf");
+    fs::write(old.join(CONF), "Theme=crimson\nLayaut=console\n").expect("old conf");
+    fs::write(new.join(CONF), "Theme=azure\n").expect("new conf");
+
+    let out = run(&Toolbox::from_env(&env_at(&root)), TOOL_READ_CONFIG, json!({}));
+    let settings = out["settings"].as_array().expect("an array");
+    let value = |key: &str| {
+        settings
+            .iter()
+            .find(|s| s["key"] == key)
+            .unwrap_or_else(|| panic!("{key} must be answered"))
+            .clone()
+    };
+    assert_eq!(value("Theme")["value"], "azure", "the new folder wins");
+    assert_eq!(
+        value("Layaut")["value"],
+        "console",
+        "the user's OLD file still outranks the system defaults"
+    );
+    assert_eq!(
+        value("SoundVolume")["value"],
+        "5",
+        "a key neither user file has still comes from the system one"
+    );
+    assert_eq!(
+        out["user_file"],
+        new.join(CONF).display().to_string(),
+        "the file a tool may write is the new one, whatever exists beside it"
+    );
+}
+
+/// The data tree keeps both names too: a layaut installed before the
+/// rename is still listed and still readable, and one under the new
+/// name shadows it exactly as a user install shadows a system one.
+#[test]
+fn a_layaut_installed_under_the_old_name_is_still_found() {
+    let root = scratch("legacy-data");
+    let old = root.join("data").join(LEGACY_APP).join("layauts");
+    fs::create_dir_all(&old).expect("old layauts");
+    fs::write(old.join("wide.layaut"), "OLD").expect("layaut");
+    fs::write(old.join("only-old.layaut"), "ONLY OLD").expect("layaut");
+
+    let tools = Toolbox::from_env(&env_at(&root));
+    assert_eq!(
+        names(&run(&tools, TOOL_LIST_LAYAUTS, json!({}))["installed"], "name"),
+        ["default", "only-old", "wide"]
+    );
+    assert_eq!(
+        run(&tools, TOOL_READ_LAYAUT, json!({ "name": "wide" }))["text"],
+        "OLD"
+    );
+
+    // The same name under the new folder takes over, and is listed once.
+    let new = root.join("data").join(APP).join("layauts");
+    fs::create_dir_all(&new).expect("new layauts");
+    fs::write(new.join("wide.layaut"), "NEW").expect("layaut");
+    let tools = Toolbox::from_env(&env_at(&root));
+    assert_eq!(
+        names(&run(&tools, TOOL_LIST_LAYAUTS, json!({}))["installed"], "name"),
+        ["default", "only-old", "wide"],
+        "one layaut, listed once"
+    );
+    assert_eq!(
+        run(&tools, TOOL_READ_LAYAUT, json!({ "name": "wide" }))["text"],
+        "NEW",
+        "the new folder wins when both hold the same name"
+    );
+}
+
+/// Writing goes to the new folder and only there. The user's old file
+/// is left byte for byte as it was found — which is what makes the
+/// rename reversible.
+#[test]
+fn a_write_lands_in_the_new_folder_and_the_old_file_is_untouched() {
+    let root = scratch("legacy-write");
+    let old = root.join("config").join(LEGACY_APP);
+    fs::create_dir_all(&old).expect("old config directory");
+    let before = "# somebody's own file\nTheme=crimson\nSounds=classic\n";
+    fs::write(old.join(CONF), before).expect("conf");
+
+    let tools = Toolbox::from_env(&env_at(&root));
+    run(&tools, TOOL_SET_THEME, json!({ "name": "azure" }));
+
+    let new = root.join("config").join(APP).join(CONF);
+    assert!(new.is_file(), "the write must land in the new folder");
+    assert!(fs::read_to_string(&new).expect("new conf").contains("Theme=azure"));
+    assert_eq!(
+        fs::read_to_string(old.join(CONF)).expect("old conf"),
+        before,
+        "the user's old file may not be touched, moved or rewritten"
+    );
+}
+
+/// What the runnable program prints its one line from. A machine with
+/// no old folder is told nothing at all.
+#[test]
+fn the_old_folders_that_are_really_there_are_the_ones_reported() {
+    let root = scratch("legacy-report");
+    fs::create_dir_all(root.join("config").join(APP)).expect("new config");
+    let dirs = DesktopDirs::from_env(&env_at(&root));
+    assert!(
+        dirs.legacy_dirs_in_use().is_empty(),
+        "a machine that never had the old folder must be told nothing"
+    );
+
+    let old_conf = root.join("config").join(LEGACY_APP);
+    let old_data = root.join("data").join(LEGACY_APP);
+    fs::create_dir_all(&old_conf).expect("old config");
+    fs::create_dir_all(&old_data).expect("old data");
+    let dirs = DesktopDirs::from_env(&env_at(&root));
+    assert_eq!(
+        dirs.legacy_dirs_in_use(),
+        vec![old_conf, old_data],
+        "both trees are reported, configuration first, and each one once"
+    );
+}
+
+/// The ordinary machine's shape: no `XDG_*` set at all, just `HOME`.
+/// Both folder names stand under `~/.config`, the new one first, and
+/// the system end of the cascade carries the pair as well.
+#[test]
+fn with_only_home_set_both_folder_names_stand_under_dot_config() {
+    let root = scratch("home-only");
+    let env: HashMap<String, String> = [("HOME".to_string(), root.display().to_string())]
+        .into_iter()
+        .collect();
+    let dirs = DesktopDirs::from_env(&env);
+    let config = root.join(".config");
+    assert_eq!(
+        dirs.conf_files(),
+        vec![
+            config.join(APP).join(CONF),
+            config.join(LEGACY_APP).join(CONF),
+            PathBuf::from("/etc/xdg").join(APP).join(CONF),
+            PathBuf::from("/etc/xdg").join(LEGACY_APP).join(CONF),
+        ]
+    );
+    assert_eq!(
+        dirs.config_dir().expect("HOME is set"),
+        config.join(APP),
+        "the write target is the family folder, never the old name"
+    );
+    assert_eq!(
+        dirs.data_roots()[..2],
+        [
+            root.join(".local/share").join(APP),
+            root.join(".local/share").join(LEGACY_APP),
+        ],
+        "the data tree pairs the names the same way"
+    );
 }
 
 /// Neither `XDG_CONFIG_HOME` nor `HOME`: there is nowhere legitimate to
