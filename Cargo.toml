@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nacelle-ai-core",
+    "crates/nacelle-ai",
+]
+
+# The whole workspace ships as one thing, so version, edition and licence
+# are decided once here and inherited. A crate that disagreed with the
+# others about any of them would be a bug, not a feature.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# 1.85 rather than 1.77 because ureq 3 is written in edition 2024 and
+# says so; claiming a lower floor than a dependency actually needs only
+# turns a clear resolver message into a confusing compiler one.
+rust-version = "1.85"
+license = "MIT"
+authors = ["Michael Furtak <michaelfurtak@tutanota.com>"]
+repository = "https://github.com/JOCKER3201/nacelle-ai"
+
+[workspace.dependencies]
+# serde_json is MIT OR Apache-2.0, as is everything it pulls in. Nothing
+# in this workspace may depend on anything outside MIT / Apache-2.0 /
+# BSD / ISC / Zlib, and nothing may pull in an async runtime — see
+# README. Note that serde's *derive* feature is deliberately not used:
+# it costs a proc-macro dependency chain, and the only thing this
+# workspace deserialises so far is a two-field configuration file.
+serde_json = "1"
+
+# ureq is the HTTP client. It blocks by design, which is why this
+# workspace can use it at all — see the no-runtime rule above. Ollama is
+# reached over plain HTTP; Anthropic needs TLS, and the feature set
+# below is what makes that possible without leaving the licences this
+# project accepts. Everything it pulls in on Linux, measured rather than
+# assumed:
+#
+#   ureq, ureq-proto, http, httparse, bytes, base64, log, itoa, libc,
+#   cfg-if, once_cell, getrandom, percent-encoding, utf8-zero, shlex, cc,
+#   rustls-pki-types, rustls-platform-verifier, openssl-probe, zeroize
+#                                              MIT OR Apache-2.0
+#   rustls, rustls-native-certs                Apache-2.0 OR ISC OR MIT
+#   rustls-webpki, untrusted                   ISC
+#   ring                                       Apache-2.0 AND ISC
+#   subtle                                     BSD-3-Clause
+#
+# The feature set is not the obvious one, and each piece is load-bearing.
+# ureq's own `rustls` feature drags in `webpki-roots`, a compiled-in copy
+# of Mozilla's CA list under CDLA-Permissive-2.0 (MPL-2.0 in older
+# releases) — permissive, but not on the list above, so it is off and the
+# trust store is loaded from the system instead (see below).
+# `rustls-no-provider` deliberately selects no crypto provider, so
+# `_ring` — ureq's internal name for the one its `rustls` feature would
+# have chosen — has to be named explicitly. It is an internal feature
+# name: if a future ureq renames it the build breaks loudly, which is the
+# good kind of breakage. `gzip` stays off, because the reply is an event
+# stream read as it arrives.
+ureq = { version = "3", default-features = false, features = [
+    "rustls-no-provider",
+    "_ring",
+] }
+
+# The operating system's trust store, which is what fills the hole left
+# by `webpki-roots` above. It is also the right answer on its own merits
+# for something that ships as part of a desktop: a root the user
+# installed works, and one the distribution withdrew stops working
+# without waiting for us to cut a release.
+#
+# ureq's `platform-verifier` feature would do the same job, but it brings
+# `webpki-root-certs` (CDLA-Permissive-2.0 again) and an Android path
+# through `jni` and `serde_derive` into Cargo.lock. None of that is
+# compiled on Linux, and none of it should have to be explained to an
+# audit either. On Linux the two are the same mechanism anyway: that
+# verifier reads the system store through this very crate.
+rustls-native-certs = "0.8"
+
+nacelle-ai-core = { path = "crates/nacelle-ai-core" }

@@ -1,0 +1,16 @@
+[package]
+name = "nacelle-ai"
+description = "The nacelle AI agent running on its own, as a program rather than a desktop widget"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nacelle-ai"
+path = "src/main.rs"
+
+[dependencies]
+nacelle-ai-core = { workspace = true }

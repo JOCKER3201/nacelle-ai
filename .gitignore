@@ -1,0 +1,14 @@
+/target
+.cargo/
+
+# Nothing that could carry a credential may ever enter this repository.
+# The agent reads its token from the environment or from a 0600 file in
+# $XDG_CONFIG_HOME/nacelle-ai/, both of which live outside the tree — but
+# a stray copy dropped here while debugging must not be committable.
+credentials.json
+*.token
+*.key
+*.pem
+.env
+.env.*
+secrets/

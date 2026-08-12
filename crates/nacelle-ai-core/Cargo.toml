@@ -1,0 +1,28 @@
+[package]
+name = "nacelle-ai-core"
+description = "The nacelle AI agent: credentials, the provider-neutral backend contract, and the conversation model both modes share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "nacelle_ai"
+
+[dependencies]
+# Tool inputs and tool results are JSON on every provider, so JSON is the
+# one wire format the core has to understand. Nothing else here is
+# serialised — the HTTP bodies belong to the backends.
+serde_json = { workspace = true }
+
+# The backends speak HTTP. ureq blocks, which is the point: a turn owns
+# a worker thread from the first byte of the request to the last byte of
+# the stream, and the desktop's event loop is never involved.
+ureq = { workspace = true }
+
+# Whose certificates to trust when the provider is reached over TLS. The
+# machine's own answer to that question, rather than a copy of Mozilla's
+# compiled into the binary — see the note in the workspace manifest.
+rustls-native-certs = { workspace = true }
