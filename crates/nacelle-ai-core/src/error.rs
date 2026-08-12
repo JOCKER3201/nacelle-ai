@@ -45,6 +45,18 @@ pub enum BackendError {
     /// The provider failed on its own account (HTTP 5xx, including the
     /// overloaded case). Worth retrying.
     Server { status: u16, message: String },
+    /// The local agent did not let this leave the machine, so no socket
+    /// was ever opened: the session is pinned local, there is no
+    /// credential, the provider has stopped answering, or the user saw
+    /// what would have been sent and said no. See
+    /// [`supervise::seal`](crate::supervise::seal).
+    ///
+    /// The string is what the agent says out loud. It is written for
+    /// the person in front of the machine and for the model that has to
+    /// plan around it, which is why it is a sentence rather than a
+    /// code: both of them need to know what could not be done here, not
+    /// merely that something failed.
+    Withheld(String),
     /// The receiver asked the stream to stop — see
     /// [`Flow::Stop`](crate::backend::Flow). Expected, not a fault; it is
     /// an error only because it means the turn has no result.
@@ -64,6 +76,12 @@ impl BackendError {
             BackendError::Auth(_)
             | BackendError::Refused { .. }
             | BackendError::Protocol(_)
+            // Retrying a withheld request would put the same manifest
+            // in front of the same user, or ask the same pinned policy
+            // the same question. The answer does not change by being
+            // asked twice, and asking twice is how a refusal gets
+            // clicked through.
+            | BackendError::Withheld(_)
             | BackendError::Cancelled => false,
         }
     }
@@ -110,6 +128,11 @@ impl fmt::Display for BackendError {
             BackendError::Server { status, message } => {
                 write!(f, "the provider failed (HTTP {status}): {message}")
             }
+            // Written as it arrives. Every other variant here is a
+            // fragment that needs a frame around it; this one is
+            // already the sentence the user is owed, and wrapping it in
+            // "backend error:" would bury the part they can act on.
+            BackendError::Withheld(tell) => f.write_str(tell),
             BackendError::Cancelled => write!(f, "the reply was cancelled by the receiver"),
         }
     }

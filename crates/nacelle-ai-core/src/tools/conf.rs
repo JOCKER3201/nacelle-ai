@@ -29,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::redact::deny::Denylist;
 use crate::tools::error::ToolError;
 use crate::tools::paths::{confine, is_identifier, safe_component, DesktopDirs};
 use crate::tools::write::{self, Replaced};
@@ -324,12 +325,15 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
 
 /// The value the cascade of `files` (most specific FIRST) gives each
 /// key, with the file it came from, sorted by key.
-pub fn effective(files: &[PathBuf]) -> Vec<Setting> {
+pub fn effective(guard: &Denylist, files: &[PathBuf]) -> Vec<Setting> {
     let mut merged: BTreeMap<String, Setting> = BTreeMap::new();
     // Least specific first, so a more specific file overwrites what a
     // less specific one said.
     for path in files.iter().rev() {
-        let Ok(text) = std::fs::read_to_string(path) else {
+        // Through the guard, because a `nacelle-desktop.conf` that is a
+        // symlink to a shell history would otherwise be parsed as a
+        // configuration file and reported line by line.
+        let Ok(text) = guard.read_to_string(path) else {
             continue;
         };
         for (key, value) in parse(&text) {
@@ -363,7 +367,12 @@ pub struct Change {
 /// filesystem. The file is created — with its directory — on the first
 /// write and not before: like the desktop, this program installs nothing
 /// into a home directory until the user changes something.
-pub fn set(dirs: &DesktopDirs, key: &ConfKey, value: &str) -> Result<Change, ToolError> {
+pub fn set(
+    dirs: &DesktopDirs,
+    guard: &Denylist,
+    key: &ConfKey,
+    value: &str,
+) -> Result<Change, ToolError> {
     let value = key.check(value)?;
     let dir = dirs.config_dir()?;
     std::fs::create_dir_all(dir).map_err(|e| ToolError::io(dir, &e))?;
@@ -375,7 +384,7 @@ pub fn set(dirs: &DesktopDirs, key: &ConfKey, value: &str) -> Result<Change, Too
     // the user's tree.
     let path = confine(dir, &dirs.user_conf()?)?;
 
-    let old = read_text(&path)?;
+    let old = read_text(guard, &path)?;
     let new = upsert(&old, key.name, &value);
     verify(&new, key.name, &value)?;
     let previous = last_value(&old, key.name);
@@ -389,12 +398,18 @@ pub fn set(dirs: &DesktopDirs, key: &ConfKey, value: &str) -> Result<Change, Too
     })
 }
 
-fn read_text(path: &Path) -> Result<String, ToolError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(ToolError::io(path, &e)),
+/// The current contents of the user's file, or nothing at all.
+///
+/// A missing file is not a failure: the first write to a fresh
+/// installation is the one that creates it. Absence is decided before
+/// the read rather than by inspecting the error afterwards, because the
+/// guard reports an I/O failure as a sentence and matching on the words
+/// in a sentence is not a way to tell two conditions apart.
+fn read_text(guard: &Denylist, path: &Path) -> Result<String, ToolError> {
+    if path.symlink_metadata().is_err() {
+        return Ok(String::new());
     }
+    guard.read_to_string(path)
 }
 
 /// The value the file's own last declaration of `key` gives.

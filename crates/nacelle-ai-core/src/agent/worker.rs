@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use crate::backend::Flow;
 use crate::message::{Message, ToolCall};
+use crate::supervise::seal::Stop;
 
 use super::approval::{ApprovalRequest, Approver, Decision};
 use super::registry::Change;
@@ -296,6 +297,19 @@ fn run(
             continue;
         }
 
+        // The same question the sink answers with `Flow::Stop`, asked
+        // where no event is produced for a sink to answer: the stretch
+        // between handing the request over and the socket being written
+        // to, which on a remote backend is layers 2, 3 and 4. Layer 3 is
+        // a whole turn against a local model and layer 4 waits on a
+        // person, and a stop pressed in there used to be read for the
+        // first time while the REPLY was being decoded — by which point
+        // the payload had gone.
+        agent.stops_when(Stop::new({
+            let cancel = cancel.clone();
+            move || cancel.is_cancelled(turn)
+        }));
+
         let mut approver = ChannelApprover {
             events: &events,
             cancel: &cancel,
@@ -316,6 +330,12 @@ fn run(
 
         let ended = match result {
             Ok(completion) => AgentEvent::Finished(completion),
+            // A turn that failed *and* was stopped is a stopped turn.
+            // The door refuses a cancelled turn with a sentence of its
+            // own, and an interface that showed that sentence as a
+            // backend failure would be telling the user something went
+            // wrong when what happened is that they pressed stop.
+            Err(_) if cancel.is_cancelled(turn) => AgentEvent::Failed(AgentError::Cancelled),
             Err(err) => AgentEvent::Failed(err),
         };
         if events.send(ended).is_err() {

@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::redact::deny::Denylist;
 use crate::tools::error::ToolError;
 use crate::tools::paths::{
     confine, safe_component, DesktopDirs, ADDONS_SUB, LAYAUTS_SUB,
@@ -133,7 +134,11 @@ pub fn layauts(dirs: &DesktopDirs) -> Vec<LayautEntry> {
 /// file it resolves to must still be inside the data directory it was
 /// found in — a `layauts/x.layaut` symlinked to `/etc/shadow` is a
 /// refusal, not a read.
-pub fn read_layaut(dirs: &DesktopDirs, name: &str) -> Result<Option<(PathBuf, String)>, ToolError> {
+pub fn read_layaut(
+    dirs: &DesktopDirs,
+    guard: &Denylist,
+    name: &str,
+) -> Result<Option<(PathBuf, String)>, ToolError> {
     let name = safe_component(name).ok_or_else(|| ToolError::Rejected {
         reason: format!("\"{name}\" is not a layaut name: one path component, no '/' and no '..'"),
     })?;
@@ -153,7 +158,11 @@ pub fn read_layaut(dirs: &DesktopDirs, name: &str) -> Result<Option<(PathBuf, St
                 limit: MAX_READ_BYTES,
             });
         }
-        let text = std::fs::read_to_string(&path).map_err(|e| ToolError::io(&path, &e))?;
+        // Confined AND guarded. Confinement says the file is in a
+        // directory this tool may look in; the guard says the file is
+        // not one this program opens at all, which is the answer for a
+        // `layauts/x.layaut` that turned out to be a private key.
+        let text = guard.read_to_string(&path)?;
         return Ok(Some((path, text)));
     }
     Ok(None)
@@ -162,7 +171,7 @@ pub fn read_layaut(dirs: &DesktopDirs, name: &str) -> Result<Option<(PathBuf, St
 /// Every addon installed under `addons/scripts` and `addons/plugins`,
 /// first root holding a name winning, scripts before plugins as the
 /// desktop scans them.
-pub fn addons(dirs: &DesktopDirs) -> Vec<AddonEntry> {
+pub fn addons(dirs: &DesktopDirs, guard: &Denylist) -> Vec<AddonEntry> {
     let mut out: Vec<AddonEntry> = Vec::new();
     for root in dirs.asset_dirs(ADDONS_SUB) {
         for (sub, ext, kind) in [
@@ -178,8 +187,8 @@ pub fn addons(dirs: &DesktopDirs) -> Vec<AddonEntry> {
                     continue;
                 }
                 out.push(match kind {
-                    AddonKind::Script => from_script(name, path),
-                    AddonKind::Plugin => from_meta(name, path),
+                    AddonKind::Script => from_script(guard, name, path),
+                    AddonKind::Plugin => from_meta(guard, name, path),
                 });
             }
         }
@@ -188,9 +197,12 @@ pub fn addons(dirs: &DesktopDirs) -> Vec<AddonEntry> {
 }
 
 /// A script declares itself in `// key: value` lines in its header.
-fn from_script(name: String, path: PathBuf) -> AddonEntry {
+fn from_script(guard: &Denylist, name: String, path: PathBuf) -> AddonEntry {
     let mut entry = bare(name, AddonKind::Script, path);
-    if let Ok(text) = std::fs::read_to_string(&entry.path) {
+    // A refused or unreadable file leaves the entry bare rather than
+    // dropping it: the addon IS installed, and saying so with no
+    // metadata is more useful than pretending it is not there.
+    if let Ok(text) = guard.read_to_string(&entry.path) {
         for line in text.lines().take(PRAGMA_LINES) {
             let Some(rest) = line.trim().strip_prefix("//") else {
                 continue;
@@ -206,9 +218,9 @@ fn from_script(name: String, path: PathBuf) -> AddonEntry {
 /// A compiled plugin declares itself in a `<name>.meta` beside the
 /// library. The metadata is read INSTEAD of the library — nothing here
 /// dlopens anything.
-fn from_meta(name: String, path: PathBuf) -> AddonEntry {
+fn from_meta(guard: &Denylist, name: String, path: PathBuf) -> AddonEntry {
     let mut entry = bare(name, AddonKind::Plugin, path);
-    if let Ok(text) = std::fs::read_to_string(entry.path.with_extension("meta")) {
+    if let Ok(text) = guard.read_to_string(&entry.path.with_extension("meta")) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {

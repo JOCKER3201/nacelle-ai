@@ -16,6 +16,14 @@
 //!
 //! What is worth knowing before changing any of it:
 //!
+//! * **Nothing is encoded that has not been through the layers.**
+//!   [`body::build`] takes a [`Sealed`] request and there is no other
+//!   way to produce a body here; [`Seal::seal`] is the only way to
+//!   produce a `Sealed`, and it runs layers 2, 3 and 4 every time. This
+//!   is the one place in the program where the user's text meets a
+//!   socket, so it is the one place worth making impossible to walk
+//!   past rather than merely inadvisable to. See
+//!   [`supervise::seal`](crate::supervise::seal).
 //! * **The credential decides a header name, not just a value.** An API
 //!   key goes in `x-api-key`; an OAuth token goes in `authorization` and
 //!   needs a beta flag alongside it. Sending an OAuth token as
@@ -45,6 +53,7 @@ use crate::credentials::{Credential, HEADER_ANTHROPIC_BETA};
 use crate::error::BackendError;
 use crate::event::StreamEvent;
 use crate::message::Request;
+use crate::supervise::seal::{Seal, Sealed};
 
 pub use transport::{HttpResponse, HttpTransport, Transport};
 
@@ -186,12 +195,20 @@ impl Default for Retry {
 
 /// The Anthropic backend.
 ///
-/// Holds a credential and a transport and nothing else that a turn
-/// depends on: the model, the tools and the conversation all arrive with
-/// the [`Request`], because they change between turns and this does not.
+/// Holds a credential, a transport and the [`Seal`], and nothing else
+/// that a turn depends on: the model, the tools and the conversation all
+/// arrive with the [`Request`], because they change between turns and
+/// these do not.
+///
+/// The seal is a field rather than an argument because it remembers
+/// across turns — what the user has already been shown, and what the
+/// last failure said about whether the provider is reachable at all —
+/// and because a backend that could be built without one would be a
+/// backend that could send unredacted text.
 pub struct Anthropic<T = HttpTransport> {
     credential: Credential,
     transport: T,
+    seal: Seal,
     endpoint: String,
     effort: Effort,
     summarise_thinking: bool,
@@ -201,8 +218,8 @@ pub struct Anthropic<T = HttpTransport> {
 
 impl Anthropic<HttpTransport> {
     /// A backend that talks to the real endpoint.
-    pub fn new(credential: Credential) -> Self {
-        Anthropic::with_transport(credential, HttpTransport::new())
+    pub fn new(credential: Credential, seal: Seal) -> Self {
+        Anthropic::with_transport(credential, seal, HttpTransport::new())
     }
 }
 
@@ -212,10 +229,11 @@ impl<T: Transport> Anthropic<T> {
     /// This is how the protocol is tested without a network, and how a
     /// desktop will later route requests through a proxy the user
     /// configured.
-    pub fn with_transport(credential: Credential, transport: T) -> Self {
+    pub fn with_transport(credential: Credential, seal: Seal, transport: T) -> Self {
         Anthropic {
             credential,
             transport,
+            seal,
             endpoint: ENDPOINT.to_string(),
             effort: Effort::default(),
             // On by default: the agent shows the user what it is doing,
@@ -263,6 +281,18 @@ impl<T: Transport> Anthropic<T> {
         self
     }
 
+    /// The seal, for an interface that wants to say whether this
+    /// session may reach the provider at all, or to pin it so that it
+    /// may not.
+    ///
+    /// Handing it out is safe in a way that handing out an encoder
+    /// would not be: everything on a [`Seal`] either reports the
+    /// policy or narrows it, and the one method that produces
+    /// something sendable is the one that runs the layers.
+    pub fn seal(&mut self) -> &mut Seal {
+        &mut self.seal
+    }
+
     /// Every header the request needs, and nothing derived from anything
     /// else.
     fn headers(&self) -> Vec<(&'static str, String)> {
@@ -293,6 +323,18 @@ impl<T: Transport> Anthropic<T> {
         headers
     }
 
+    /// The bytes of one turn.
+    ///
+    /// Takes the [`Sealed`] request rather than the [`Request`] the
+    /// caller handed over, and so does everything below it. That is the
+    /// whole mechanism: there is no path from a `Request` to a socket in
+    /// this file that does not pass through [`Seal::seal`].
+    fn encode(&self, sealed: &Sealed) -> Result<Vec<u8>, BackendError> {
+        serde_json::to_vec(&body::build(sealed, self.effort, self.summarise_thinking)).map_err(
+            |err| BackendError::Protocol(format!("the request could not be encoded: {err}")),
+        )
+    }
+
     /// One attempt: send, then either read the stream or work out what
     /// the status meant.
     fn attempt(
@@ -316,11 +358,22 @@ impl<T: Transport> Backend for Anthropic<T> {
         NAME
     }
 
+    /// Handed straight to the seal, which is what is actually in the
+    /// window: everything between the caller asking for a turn and
+    /// `transport.post` is layers 2, 3 and 4.
+    fn stops_when(&mut self, stop: crate::supervise::seal::Stop) {
+        self.seal.stops_when(stop);
+    }
+
     fn send(&mut self, request: &Request, sink: &mut EventSink<'_>) -> Result<(), BackendError> {
-        let body = serde_json::to_vec(&body::build(request, self.effort, self.summarise_thinking))
-            .map_err(|err| {
-                BackendError::Protocol(format!("the request could not be encoded: {err}"))
-            })?;
+        // Layers 2, 3 and 4, before anything else happens and with
+        // nothing to skip them with. A refusal here — a pinned session,
+        // a provider that has stopped answering, a user who read the
+        // manifest and said no — is not a failed turn: no socket was
+        // opened, and the sentence that comes back says which of those
+        // it was.
+        let sealed = self.seal.seal(request)?;
+        let body = self.encode(&sealed)?;
         let headers = self.headers();
 
         let attempts = self.retry.attempts.max(1);
@@ -337,7 +390,7 @@ impl<T: Transport> Backend for Anthropic<T> {
                     emitted = true;
                     sink(event)
                 };
-                self.attempt(&headers, &body, &request.model, &mut watch)
+                self.attempt(&headers, &body, &sealed.request().model, &mut watch)
             };
 
             let err = match outcome {
@@ -352,6 +405,14 @@ impl<T: Transport> Backend for Anthropic<T> {
             // failure after the first event is final — the caller can
             // start a new turn if it wants one.
             if emitted || attempt >= attempts || !err.is_retryable() {
+                // What this turn learned about the remote half, before
+                // the error leaves. A provider that could not be
+                // reached, or a credential it rejected, stops the NEXT
+                // turn at the seal instead of at a socket — which is
+                // the point of "no network degrades exactly like a
+                // pin": the local half never waits on the remote half
+                // twice to find out the same thing.
+                self.seal.observe(&err);
                 return Err(err);
             }
 

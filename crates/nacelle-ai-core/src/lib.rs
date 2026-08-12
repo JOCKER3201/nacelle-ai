@@ -10,6 +10,8 @@
 //! | [`error`] | how a backend fails |
 //! | [`tools`] | what the agent can do to the desktop around it |
 //! | [`agent`] | the loop: ask, run what was asked for, ask again, stop |
+//! | [`redact`] | what never leaves this machine, in four layers |
+//! | [`supervise`] | when the local agent asks the remote one, and the background watch |
 //!
 //! Two rules shape all of it.
 //!
@@ -31,6 +33,8 @@ pub mod credentials;
 pub mod error;
 pub mod event;
 pub mod message;
+pub mod redact;
+pub mod supervise;
 pub mod tools;
 
 pub use agent::worker::{Cancel, PendingApproval, TurnId, Worker};
@@ -44,6 +48,17 @@ pub use credentials::{Credential, CredentialError, CredentialKind, Env, Origin, 
 pub use error::BackendError;
 pub use event::{StopReason, StreamEvent, Usage};
 pub use message::{Content, Message, Request, Role, ToolCall, ToolDeclaration};
+pub use redact::deny::{Denial, Denylist, Reason};
+pub use redact::manifest::{Disclosure, Manifest, Why};
+pub use redact::review::{LocalReviewer, NoReview, NotLocal, Removal, Review, Reviewer};
+pub use redact::scan::{Finding, Redacted};
+pub use redact::{Gathering, Outgoing, Source};
+pub use supervise::escalate::{Attempts, Grounds, Policy, Remote, Trigger};
+pub use supervise::handoff::{over_channel, ChannelDiscloser, Cleared, Consent, Discloser, Handoff,
+                             NobodyToAsk, PendingDisclosure, Sending};
+pub use supervise::seal::{payload_of, NotSent, Seal, Sealed, Stop};
+pub use supervise::watch::{Check, Observation, Reporter, Reports, Status, Threshold, Watch,
+                           WatchHandle};
 pub use tools::error::ToolError;
 pub use tools::paths::DesktopDirs;
 pub use tools::Toolbox;

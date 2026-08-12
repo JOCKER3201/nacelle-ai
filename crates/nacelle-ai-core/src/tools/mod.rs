@@ -33,6 +33,14 @@
 //! block with `is_error` set — which is how the model finds out to try
 //! something else instead of telling the user it worked.
 //!
+//! Every READ goes through the denylist in
+//! [`redact::deny`](crate::redact::deny) before it happens. Not because
+//! a theme directory is likely to hold an SSH key, but because a file in
+//! it can be a symlink to one, and because a rule that is applied on
+//! some read paths and not others is a rule that will be missing from
+//! the one that mattered. The guard is a parameter to every function
+//! here that opens a file, so a read that forgot it does not compile.
+//!
 //! Nothing here reads the process environment on its own. A [`Toolbox`]
 //! is built from an [`Env`], so the desktop passes the real one and a
 //! test passes a map pointing at a throwaway directory.
@@ -55,6 +63,7 @@ use serde_json::{json, Map, Value};
 
 use crate::credentials::Env;
 use crate::message::{Content, ToolCall, ToolDeclaration};
+use crate::redact::deny::Denylist;
 use crate::tools::catalog::{AddonEntry, BUILTIN_LAYAUT};
 use crate::tools::conf::{Change, ConfKey, Setting, KEYS};
 use crate::tools::error::ToolError;
@@ -100,21 +109,50 @@ const BUILTIN_WIDGETS_NOTE: &str =
 #[derive(Clone, Debug)]
 pub struct Toolbox {
     dirs: DesktopDirs,
+    guard: Denylist,
 }
 
 impl Toolbox {
+    /// A toolbox with the name, extension and content rules of the
+    /// denylist but none of its home-relative directories — see
+    /// [`Denylist::new`]. [`Toolbox::from_env`] is what a real
+    /// installation uses; this is for an embedder that has already
+    /// decided where everything lives.
     pub fn new(dirs: DesktopDirs) -> Self {
-        Toolbox { dirs }
+        Toolbox {
+            dirs,
+            guard: Denylist::new(None),
+        }
     }
 
     /// The toolbox for the installation the given environment
     /// describes.
     pub fn from_env(env: &dyn Env) -> Self {
-        Toolbox::new(DesktopDirs::from_env(env))
+        Toolbox {
+            dirs: DesktopDirs::from_env(env),
+            guard: Denylist::from_env(env),
+        }
+    }
+
+    /// Use a denylist built elsewhere — one the embedder has added its
+    /// own directories to, say.
+    ///
+    /// This cannot weaken anything. The name, extension and content
+    /// rules are part of every [`Denylist`] there is and cannot be
+    /// constructed without, so the poorest list that can be passed here
+    /// is the one [`Toolbox::new`] would have made.
+    pub fn with_guard(mut self, guard: Denylist) -> Self {
+        self.guard = guard;
+        self
     }
 
     pub fn dirs(&self) -> &DesktopDirs {
         &self.dirs
+    }
+
+    /// The denylist every read in this toolbox goes through.
+    pub fn guard(&self) -> &Denylist {
+        &self.guard
     }
 
     /// What the model is told it may call.
@@ -298,7 +336,7 @@ impl Toolbox {
     fn set_theme(&self, input: &Value) -> Result<Value, ToolError> {
         let name = string_field(TOOL_SET_THEME, input, "name")?;
         let key = conf_key("Theme");
-        let change = conf::set(&self.dirs, key, &name)?;
+        let change = conf::set(&self.dirs, &self.guard, key, &name)?;
         let mut result = changed(&change);
         // Not an error: the toolkit carries themes compiled into it, so
         // a name that is not a file may still be perfectly good. It is
@@ -347,7 +385,7 @@ impl Toolbox {
 
     fn read_layaut(&self, input: &Value) -> Result<Value, ToolError> {
         let name = string_field(TOOL_READ_LAYAUT, input, "name")?;
-        if let Some((found, text)) = catalog::read_layaut(&self.dirs, &name)? {
+        if let Some((found, text)) = catalog::read_layaut(&self.dirs, &self.guard, &name)? {
             return Ok(json!({
                 "name": name.trim(),
                 "path": path(&found),
@@ -389,11 +427,11 @@ impl Toolbox {
                 ),
             });
         }
-        Ok(changed(&conf::set(&self.dirs, key, &wanted)?))
+        Ok(changed(&conf::set(&self.dirs, &self.guard, key, &wanted)?))
     }
 
     fn list_addons(&self) -> Result<Value, ToolError> {
-        let addons = catalog::addons(&self.dirs);
+        let addons = catalog::addons(&self.dirs, &self.guard);
         Ok(json!({
             "addons": addons.iter().map(addon).collect::<Vec<_>>(),
             "searched": self
@@ -408,7 +446,7 @@ impl Toolbox {
 
     fn read_config(&self) -> Result<Value, ToolError> {
         let files = self.dirs.conf_files();
-        let settings = conf::effective(&files);
+        let settings = conf::effective(&self.guard, &files);
         Ok(json!({
             "user_file": self.dirs.user_conf().ok().as_deref().map(path),
             "files": files
@@ -450,12 +488,12 @@ impl Toolbox {
                 ),
             });
         };
-        Ok(changed(&conf::set(&self.dirs, key, &value)?))
+        Ok(changed(&conf::set(&self.dirs, &self.guard, key, &value)?))
     }
 
     /// The effective value of one configuration key.
     fn setting(&self, key: &str) -> Option<Setting> {
-        conf::effective(&self.dirs.conf_files())
+        conf::effective(&self.guard, &self.dirs.conf_files())
             .into_iter()
             .find(|s| s.key == key)
     }

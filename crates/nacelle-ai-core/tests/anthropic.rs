@@ -16,8 +16,8 @@ use std::time::Duration;
 use nacelle_ai::backend::anthropic::{self, Anthropic, Effort, HttpResponse, Retry, Transport};
 use nacelle_ai::credentials::Credential;
 use nacelle_ai::{
-    Backend, BackendError, Content, Flow, Message, Request, Role, StopReason, StreamEvent,
-    ToolDeclaration,
+    Backend, BackendError, Consent, Content, Flow, Manifest, Message, Policy, Remote, Request,
+    Role, Seal, StopReason, StreamEvent, ToolDeclaration, Trigger,
 };
 use serde_json::{json, Value};
 
@@ -180,6 +180,22 @@ fn no_waiting() -> Retry {
     }
 }
 
+/// The seal these tests build their backend with.
+///
+/// A session that may escalate, nothing pinned, no local model to run
+/// layer 3, and a user who says yes — because what this file is about
+/// is the wire, and a manifest nobody answers would stop every test in
+/// it at layer 4. The tests about the layers themselves are in
+/// `seal.rs`, and they build seals that say no.
+fn agreed() -> Seal {
+    Seal::new(
+        anthropic::NAME,
+        Policy::new(Remote::Ready),
+        Trigger::UserAsked,
+        |_: &Manifest| Consent::Send,
+    )
+}
+
 fn turn(
     replies: Vec<Reply>,
     request: &Request,
@@ -194,7 +210,7 @@ fn turn_with(
 ) -> (Result<(), BackendError>, Vec<StreamEvent>, Arc<Stub>) {
     let stub = Stub::new(replies);
     let mut backend =
-        Anthropic::with_transport(credential, Handle::to(&stub)).with_retry(no_waiting());
+        Anthropic::with_transport(credential, agreed(), Handle::to(&stub)).with_retry(no_waiting());
 
     let mut events = Vec::new();
     let result = backend.send(request, &mut |event| {
@@ -333,7 +349,7 @@ fn the_reply_is_the_same_however_the_bytes_arrive() {
             chunk,
             ..ok(a_turn_with_a_tool_call())
         }]);
-        let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), Handle(stub));
+        let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), agreed(), Handle(stub));
         let mut events = Vec::new();
         backend
             .send(&ask(), &mut |event| {
@@ -580,7 +596,7 @@ fn a_reply_that_stops_early_is_a_failure() {
 #[test]
 fn stopping_the_sink_cancels_the_turn() {
     let stub = Stub::new(vec![ok(a_turn_with_a_tool_call())]);
-    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), Handle(stub));
+    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), agreed(), Handle(stub));
 
     let mut events = Vec::new();
     let result = backend.send(&ask(), &mut |event| {
@@ -668,7 +684,7 @@ fn thinking_is_left_out_unless_it_was_asked_for() {
 #[test]
 fn effort_is_the_dial_and_it_goes_out_with_every_request() {
     let stub = Stub::new(vec![ok(a_plain_turn("end_turn"))]);
-    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), Handle::to(&stub))
+    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), agreed(), Handle::to(&stub))
         .with_effort(Effort::XHigh)
         .with_thinking_summary(false);
 
@@ -722,7 +738,13 @@ fn every_tool_result_rides_in_the_one_user_message() {
 
     assert_eq!(last["role"], json!("user"));
     assert_eq!(last["content"].as_array().expect("blocks").len(), 2);
-    assert_eq!(last["content"][0]["tool_use_id"], json!("toolu_1"));
+    // The seal renumbers identifiers on the copy it encodes, so what
+    // matters here is that the result still names the call it answers —
+    // not what the conversation happened to call it.
+    assert_eq!(
+        last["content"][0]["tool_use_id"],
+        body["messages"][1]["content"][1]["id"]
+    );
     // Said only when it is true: telling the model every successful call
     // did not fail is noise in its context.
     assert!(last["content"][0].get("is_error").is_none());
@@ -835,7 +857,7 @@ fn beta_flags_are_merged_into_the_one_header() {
     // reads one. So the flag an OAuth credential brings and the flags a
     // backend adds have to end up in the same value.
     let stub = Stub::new(vec![ok(a_plain_turn("end_turn"))]);
-    let mut backend = Anthropic::with_transport(Credential::oauth(TOKEN), Handle::to(&stub))
+    let mut backend = Anthropic::with_transport(Credential::oauth(TOKEN), agreed(), Handle::to(&stub))
         .with_beta("fine-grained-tool-streaming-2025-05-14")
         .with_beta("token-efficient-tools-2024-11-01");
 
@@ -1003,7 +1025,7 @@ fn a_rate_limit_carries_the_provider_s_own_delay() {
         )
     }]);
     // One attempt, so the delay is reported rather than slept through.
-    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), Handle(stub))
+    let mut backend = Anthropic::with_transport(Credential::api_key(TOKEN), agreed(), Handle(stub))
         .with_retry(Retry {
             attempts: 1,
             ..no_waiting()
@@ -1039,7 +1061,7 @@ fn no_failure_anywhere_carries_the_credential() {
         for credential in [Credential::api_key(TOKEN), Credential::oauth(TOKEN)] {
             let stub = Stub::new(vec![Reply { ..reply_of(&reply) }]);
             let mut backend =
-                Anthropic::with_transport(credential, Handle(stub)).with_retry(Retry {
+                Anthropic::with_transport(credential, agreed(), Handle(stub)).with_retry(Retry {
                     attempts: 1,
                     ..no_waiting()
                 });
@@ -1090,7 +1112,7 @@ fn the_models_offered_are_named_exactly_as_the_endpoint_wants_them() {
 
 #[test]
 fn the_backend_names_itself_and_nothing_else() {
-    let backend = Anthropic::with_transport(Credential::api_key(TOKEN), Handle(Stub::new(vec![])));
+    let backend = Anthropic::with_transport(Credential::api_key(TOKEN), agreed(), Handle(Stub::new(vec![])));
     // Never a URL, never anything derived from the credential.
     assert_eq!(backend.name(), "anthropic");
 
