@@ -14,15 +14,24 @@
 //! * **The system prompt is where caching pays.** It is the one part of
 //!   a request that is byte-identical from turn to turn, so it carries
 //!   the cache breakpoint.
+//!
+//! And the one that is not about the wire format at all: [`build`] takes
+//! a [`Sealed`] request, not a [`Request`]. This is the last function
+//! before the bytes exist, so it is where "everything that leaves has
+//! been through the layers" stops being a rule somebody has to remember
+//! and becomes something the compiler will not let anyone forget — see
+//! [`supervise::seal`](crate::supervise::seal).
 
 use serde_json::{json, Map, Value};
 
 use crate::message::{Content, Message, Request, Role};
+use crate::supervise::seal::Sealed;
 
 use super::Effort;
 
 /// Build the body for one turn.
-pub(super) fn build(request: &Request, effort: Effort, summarise_thinking: bool) -> Value {
+pub(super) fn build(sealed: &Sealed, effort: Effort, summarise_thinking: bool) -> Value {
+    let request = sealed.request();
     let (system, messages) = conversation(request);
 
     let mut body = Map::new();

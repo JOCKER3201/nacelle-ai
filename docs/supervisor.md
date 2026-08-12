@@ -38,6 +38,22 @@ cannot be recalled.
 So the model is the **last** layer, not the first. The layers, in order of
 strength:
 
+And one thing has to be said before the list, because the list reads like a
+proof and is not one. Layers 2 and 3 are **pattern matching over arbitrary
+text**, and that is a problem nobody closes by patching it. Three rounds of
+adversaries have attacked this boundary; each round found holes the previous
+one had not, and the third found the redaction marker quoting the key it had
+just cut. Every one of those was measured on the bytes handed to the socket.
+A fourth round will find a fourth thing.
+
+That is not an argument for giving up on the layers — they turn a careless
+paste into a redacted one, which is most of the real risk. It is an argument
+against ever describing them as a seal. The guarantee in this design is layer
+1 and the pin: what is never read cannot leave, and a session pinned to the
+machine opens no socket. Everything below is risk reduction, and the README's
+"What this does not protect" carries the current, measured list of what gets
+through.
+
 ### Layer 1 — never read it
 
 The strongest guarantee about a secret is that the program never opened the
@@ -64,16 +80,32 @@ deterministically. Pattern matching, not judgment:
 
 - PEM armor (`-----BEGIN ... PRIVATE KEY-----`)
 - provider-shaped credentials: `sk-ant-…`, `sk-…`, `ghp_…`, `gho_…`,
-  `AKIA…`, `xox[baprs]-…`, `AIza…`
+  `glpat-…`, `AKIA…`, `xox[baprs]-…`, `xapp-…`, `AIza…`
 - bearer tokens and `Authorization:` header lines
 - JWTs (three base64url segments separated by dots)
 - connection strings carrying a password (`scheme://user:pass@host`)
 - long high-entropy strings that match no natural-language profile
+- the same, read again with the payload's **wrapping taken out** — line
+  breaks, spaces and invisible characters woven through a key — because a
+  credential broken into pieces is not one run and every rule above would
+  otherwise look at each piece and pass
 
 A hit does not warn — it **redacts**, replacing the value with a marker that
 says what was removed and why. The agent's own reasoning sees the marker, so it
 knows something was withheld and can ask the user rather than silently
-producing a wrong answer.
+producing a wrong answer. The marker never quotes what it replaced: every word
+in it is one of this program's own constants.
+
+Two strings on the wire cannot carry a marker, because the far side verifies or
+looks them up: the model id and a thinking block's signature. Those are read by
+the same rules and a hit **stops the turn** instead. A tool call's identifier
+is neither redacted nor checked — it is **renumbered**, so whatever the local
+model put in that field is not what leaves.
+
+What this layer cannot do is written out in the README under *What this does not
+protect*. The two that matter most: a short secret with no name and no prefix is
+indistinguishable from an identifier and goes; and a forty-character hex digest
+is indistinguishable from a forty-character token, so both are cut.
 
 ### Layer 3 — then ask the model
 
@@ -87,9 +119,20 @@ never restore what layers 1 and 2 took out.
 ### Layer 4 — the user sees the manifest
 
 Before the first escalation of a session, and whenever the outgoing payload
-includes file content the user has not already seen in the conversation, the
-user is shown **what is about to leave the machine**: which files, how many
-bytes, and what was redacted. Escalation proceeds on their word.
+includes file content the user has not already answered for, the user is shown
+**what is about to leave the machine**: which files, how many bytes, and what
+was redacted. Escalation proceeds on their word.
+
+A request records no provenance of its own, so "which files" is worked out from
+the calls the results answer: a result whose call passed a path to a declared
+tool is a file with a name. A file the model quoted into its own prose has no
+name, and the manifest says so on its own face rather than letting the list read
+as complete — which also means the second rule above fires on files and not on
+prose. Something private the user typed is disclosed on the first escalation of
+the session and not again.
+
+The size on the manifest covers every string that reaches the socket, including
+the two the layers may read but not edit.
 
 This is the layer that makes the other three auditable. Without it the user has
 to trust three mechanisms they cannot observe.

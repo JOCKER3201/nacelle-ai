@@ -39,6 +39,13 @@ pub enum ToolError {
     /// through `..`, through an absolute path, or through a symlink
     /// pointing out of the tree. A refusal, never a write.
     Outside { input: String, root: PathBuf },
+    /// The file is on the read denylist — see
+    /// [`redact::deny`](crate::redact::deny). Distinct from
+    /// [`ToolError::Outside`] on purpose: that one says "not this
+    /// tool's business", this one says "not this program's business at
+    /// all", and only the second is worth repeating to the user
+    /// verbatim. `why` is the whole sentence, already written for them.
+    Denied { path: PathBuf, why: String },
     /// The file is bigger than a tool result should ever carry. Better
     /// to say so than to hand a model a megabyte of text.
     TooLarge { path: PathBuf, size: u64, limit: u64 },
@@ -71,6 +78,9 @@ impl fmt::Display for ToolError {
                  files inside that directory",
                 root.display()
             ),
+            // The path is already in `why`, which is the sentence the
+            // denylist wrote; repeating it here would say it twice.
+            ToolError::Denied { why, .. } => f.write_str(why),
             ToolError::TooLarge { path, size, limit } => write!(
                 f,
                 "{} is {size} bytes, over the {limit}-byte limit for a tool result; \

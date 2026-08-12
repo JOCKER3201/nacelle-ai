@@ -19,7 +19,21 @@
 //! `Sync`: one turn at a time, one thread at a time. Two concurrent
 //! turns are two backends.
 //!
-//! One provider per submodule.
+//! One provider per submodule, and one rule that spans them: **a
+//! provider this program authenticates to is a provider whose requests
+//! go through [`supervise::seal`](crate::supervise::seal) first.** The
+//! rule is not enforced by this trait — a trait cannot demand that an
+//! implementor's private encoder take a particular argument — so it is
+//! enforced where it can be, inside the one backend it applies to:
+//! [`anthropic::Anthropic`] holds a [`Seal`](crate::supervise::Seal) it
+//! cannot be built without, and its encoder takes a
+//! [`Sealed`](crate::supervise::Sealed) request and nothing else. A
+//! future third-party backend is written the same way, and the reason
+//! it must be is in that module's header.
+//!
+//! [`ollama::Ollama`] deliberately has no seal: the layers exist for
+//! bytes reaching a third party under a credential, and it reaches
+//! neither.
 
 pub mod anthropic;
 pub mod ollama;
@@ -58,6 +72,20 @@ pub trait Backend: Send {
     /// derived from a credential.
     fn name(&self) -> &str;
 
+    /// Whether a turn on this backend stays on the user's own machine.
+    ///
+    /// The default is `false`, which is the safe answer: a backend that
+    /// has not thought about the question is one whose bytes might
+    /// leave. Two things ask, and both would be defeated by a hopeful
+    /// default — the escalation policy, which is the difference between
+    /// answering locally and sending, and
+    /// [`LocalReviewer`](crate::redact::LocalReviewer), which refuses to
+    /// hand a payload to a remote model in order to ask whether the
+    /// payload may be sent.
+    fn is_local(&self) -> bool {
+        false
+    }
+
     /// Run one turn, blocking until it finishes.
     ///
     /// On success the sink has been called with exactly one
@@ -71,4 +99,17 @@ pub trait Backend: Send {
         request: &Request,
         sink: &mut EventSink<'_>,
     ) -> Result<(), BackendError>;
+
+    /// Tell this backend how to find out whether the turn it is about to
+    /// run has been stopped.
+    ///
+    /// Defaulted to nothing, because a local backend has nothing to stop
+    /// early: its bytes do not leave. What it is for is the window
+    /// between "the caller asked for a turn" and "the request was
+    /// posted", which on a remote backend is where the seal's layers
+    /// run — layer 3 is a whole turn against a local model and layer 4
+    /// waits on a person. [`Flow::Stop`] cannot cover that window: the
+    /// sink is not called until the reply is being decoded, which is
+    /// after the socket.
+    fn stops_when(&mut self, _stop: crate::supervise::seal::Stop) {}
 }

@@ -8,6 +8,26 @@
 //! their models on the machine in the next room is still running their
 //! own models.
 //!
+//! **Nothing here redacts, and that is a decision rather than an
+//! omission.** The Anthropic backend cannot encode a request that has
+//! not been through layers 2, 3 and 4 — see
+//! [`supervise::seal`](crate::supervise::seal) — and this one has no
+//! seal at all. The layers exist because a payload is about to reach a
+//! third party's endpoint, under a credential, where one miss cannot be
+//! recalled. None of that is true of a model on the user's own machine:
+//! redacting there would hide the user's own files from the only agent
+//! they asked to look at them, and buy nothing, since the bytes are
+//! already where they started.
+//!
+//! The one case worth stating out loud is an `OLLAMA_HOST` pointing at
+//! another machine. Those bytes do cross a wire, and they cross it
+//! unredacted — because the user named that host themselves, no
+//! credential is involved and no third party is on the other end. What
+//! that costs is honesty about the word "local", which is why
+//! [`Backend::is_local`] answers strictly: layer 3 asks a different
+//! question — *may this model be shown the payload* — and for the
+//! machine in the next room the answer to that one is no.
+//!
 //! Two things about the wire shape the code.
 //!
 //! **The stream is NDJSON, not SSE.** One JSON object per line, each
@@ -214,6 +234,20 @@ impl Default for Ollama {
 impl Backend for Ollama {
     fn name(&self) -> &str {
         NAME
+    }
+
+    /// True only when the server is on the loopback interface.
+    ///
+    /// A stricter answer than "is this the user's own model", and
+    /// deliberately so. The callers of this ask one question — do these
+    /// bytes cross a wire — and for an `OLLAMA_HOST` pointing at the
+    /// machine in the next room the honest answer is yes, however much
+    /// that machine belongs to the same person. Being wrong in this
+    /// direction costs a refused shortcut; being wrong in the other
+    /// costs a payload on a network the user did not think they were
+    /// using.
+    fn is_local(&self) -> bool {
+        is_loopback(&self.host)
     }
 
     fn send(&mut self, request: &Request, sink: &mut EventSink<'_>) -> Result<(), BackendError> {
@@ -797,6 +831,31 @@ fn normalise_host(raw: &str) -> String {
     };
 
     format!("{scheme}://{host}{path}")
+}
+
+/// Whether a normalised host is this very machine.
+///
+/// Works on the output of [`normalise_host`], so the scheme and the port
+/// are always there and the authority is always the last thing before a
+/// path. Anything that is not plainly loopback is treated as remote:
+/// a name that happens to resolve to `127.0.0.1` today is a DNS answer,
+/// not a promise.
+pub fn is_loopback(host: &str) -> bool {
+    let rest = host.split_once("://").map(|(_, rest)| rest).unwrap_or(host);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let name = match authority.rsplit_once(']') {
+        // `[::1]:11434` — the brackets hold the address.
+        Some((address, _)) => address.trim_start_matches('[').to_string(),
+        None => authority
+            .rsplit_once(':')
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_else(|| authority.to_string()),
+    };
+    let name = name.to_ascii_lowercase();
+    name == "localhost"
+        || name == "::1"
+        || name == "0:0:0:0:0:0:0:1"
+        || name.starts_with("127.")
 }
 
 /// Whether an authority already names a port, minding that the colons in

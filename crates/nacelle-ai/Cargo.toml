@@ -13,4 +13,26 @@ name = "nacelle-ai"
 path = "src/main.rs"
 
 [dependencies]
+# The agent itself: credentials, the backends, the tools and the loop.
+# Nothing in this crate re-implements any of it — see the module header
+# in src/main.rs for the line between the two.
 nacelle-ai-core = { workspace = true }
+
+# The toolkit. The theme engine and its master `default.theme`, the
+# model/view core the conversation scrolls on, and the text input the
+# question is typed into. The crate is `libnacelle`, the name in code is
+# `nacelle::`.
+libnacelle = { workspace = true }
+
+# The frames. Everything above hands it one vertex stream per frame.
+nacelle-renderer = { workspace = true }
+
+# The window and its events.
+winit = { workspace = true }
+
+[dev-dependencies]
+# Tool arguments are JSON on every provider, so a test that builds a tool
+# call has to build one. Nothing outside the tests reaches for it — the
+# window shows a call's arguments as the text the core already made of
+# them — which is why it is here and not above.
+serde_json = { workspace = true }

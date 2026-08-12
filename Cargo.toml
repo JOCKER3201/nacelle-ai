@@ -20,10 +20,28 @@ authors = ["Michael Furtak <michaelfurtak@tutanota.com>"]
 repository = "https://github.com/JOCKER3201/nacelle-ai"
 
 [workspace.dependencies]
-# serde_json is MIT OR Apache-2.0, as is everything it pulls in. Nothing
-# in this workspace may depend on anything outside MIT / Apache-2.0 /
-# BSD / ISC / Zlib, and nothing may pull in an async runtime — see
-# README. Note that serde's *derive* feature is deliberately not used:
+# The licence rule for this workspace, written out once so that the next
+# audit starts from here rather than from nothing:
+#
+#   * Anything under MIT / Apache-2.0 / BSD / ISC / Zlib is fine, and
+#     that is what a new direct dependency should be.
+#   * MPL-2.0 is fine as an UNMODIFIED dependency. Its copyleft is
+#     per-file: it reaches files taken from the crate and changed, and
+#     compiling against one does not touch this workspace's own files.
+#     Nothing here patches, vendors or forks such a crate, and if that
+#     ever changes the changed files go back under MPL-2.0.
+#   * CC0-1.0 is a dedication to the public domain — fewer obligations
+#     than MIT, not more.
+#   * Nothing may pull in an async runtime. See README.
+#
+# What arrives under the last two comes in through libnacelle's script
+# engine and its own graph, not through anything named in this file, and
+# none of it is modified here:
+#
+#   smartstring 1.0.1                          MPL-2.0   (via rhai)
+#   hexf-parse 0.2.1, tiny-keccak 2.0.2        CC0-1.0
+#
+# serde_json is MIT OR Apache-2.0, as is everything it pulls in. Note that serde's *derive* feature is deliberately not used:
 # it costs a proc-macro dependency chain, and the only thing this
 # workspace deserialises so far is a two-field configuration file.
 serde_json = "1"
@@ -73,5 +91,33 @@ ureq = { version = "3", default-features = false, features = [
 # audit either. On Linux the two are the same mechanism anyway: that
 # verifier reads the system store through this very crate.
 rustls-native-certs = "0.8"
+
+# The toolkit the whole nacelle project is built on: the theme engine and
+# its master `default.theme`, the drawing vocabulary, the glyph atlas, the
+# model/view core and the interface objects. The crate is `libnacelle` and
+# the name in code is `nacelle::`, which is why the two differ here.
+#
+# It is named WITHOUT a `rev`, and that is not an oversight. nacelle-renderer
+# depends on the same repository without one, and cargo keys a git source on
+# its reference: a `rev` here and a bare branch there are two SourceIds, so
+# the toolkit would be compiled TWICE and `nacelle::draw::DrawList` from one
+# copy would not be the type the renderer's `render` accepts. `[patch]`
+# cannot join them either — cargo rejects a patch that points at the source
+# it is patching. What pins the build is therefore Cargo.lock, which records
+# the exact commit and is committed; `cargo update -p libnacelle` is the
+# deliberate act that moves it.
+libnacelle = { git = "https://github.com/JOCKER3201/libnacelle" }
+
+# The Vulkan renderer, a repository of its own — the same crate
+# nacelle-desktop draws with, and the reason this window is a real embedder
+# of the toolkit rather than a second drawing stack. Pinned by `rev`, which
+# it can be: nothing else in the graph names it.
+nacelle-renderer = { git = "https://github.com/JOCKER3201/nacelle-renderer", rev = "873c3280259774cccf7177a614e72fae0188abe0" }
+
+# The window and its events. winit blocks in `run` and calls back — no
+# reactor, no executor — which is exactly the shape the no-runtime rule
+# above demands, and the same version nacelle-desktop is built on, so the
+# toolkit meets the event loop it was written against.
+winit = "0.29"
 
 nacelle-ai-core = { path = "crates/nacelle-ai-core" }

@@ -330,6 +330,18 @@ impl Agent {
         self.ask_message(Message::user(question), approver, sink)
     }
 
+    /// Tell the backend how to find out whether the turn it is running
+    /// has been stopped.
+    ///
+    /// The sink already carries [`Flow::Stop`], and it covers the half
+    /// of a turn that produces events. This covers the other half: on a
+    /// remote backend, everything between the request being handed over
+    /// and the socket being written to is the seal's layers, and no
+    /// event is produced in there for a sink to answer.
+    pub fn stops_when(&mut self, stop: crate::supervise::seal::Stop) {
+        self.backend.stops_when(stop);
+    }
+
     /// The same, for a turn that is more than text — a pasted file, an
     /// answer carrying tool results the caller produced itself.
     pub fn ask_message(

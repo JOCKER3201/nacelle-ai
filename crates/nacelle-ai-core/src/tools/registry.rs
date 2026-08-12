@@ -43,7 +43,7 @@ impl ToolRegistry for Toolbox {
     fn environment(&self) -> Vec<EnvironmentFact> {
         let themes = catalog::themes(self.dirs());
         let layauts = catalog::layauts(self.dirs());
-        let addons = catalog::addons(self.dirs());
+        let addons = catalog::addons(self.dirs(), self.guard());
         vec![
             EnvironmentFact::new("themes")
                 .with_note(BUILTIN_THEMES_NOTE)
