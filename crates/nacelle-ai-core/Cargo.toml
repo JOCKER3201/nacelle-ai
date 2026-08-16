@@ -13,9 +13,15 @@ name = "nacelle_ai"
 
 [dependencies]
 # Tool inputs and tool results are JSON on every provider, so JSON is the
-# one wire format the core has to understand. Nothing else here is
-# serialised — the HTTP bodies belong to the backends.
+# one wire format the core has to understand for the MODELS. The HTTP
+# bodies belong to the backends.
 serde_json = { workspace = true }
+
+# The configuration the tools edit is RON — `nacelle/nacelle-desktop.ron`,
+# per the owner's decision — read and written through the same typed
+# model the desktop derives its parser from. See `tools::model`.
+ron = { workspace = true }
+serde = { workspace = true }
 
 # The backends speak HTTP. ureq blocks, which is the point: a turn owns
 # a worker thread from the first byte of the request to the last byte of

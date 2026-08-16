@@ -2,8 +2,9 @@
 //!
 //! There is no channel to a RUNNING nacelle-desktop yet — that is a
 //! later stage of the project — so every tool here works on the FILES
-//! the desktop reads: its `nacelle-desktop.conf`, the layauts, the
-//! themes and the addons on the XDG search path. A change therefore
+//! the desktop reads: its `nacelle-desktop.ron` (and the `Key=Value`
+//! file that came before it, read-only), the layauts, the themes and
+//! the addons on the XDG search path. A change therefore
 //! takes effect when the desktop next reads the file, not when the tool
 //! returns, and every tool that writes says exactly that in its own
 //! description. A model that promised the user an instant effect would
@@ -55,6 +56,7 @@
 pub mod catalog;
 pub mod conf;
 pub mod error;
+pub mod model;
 pub mod paths;
 mod registry;
 pub mod write;
@@ -173,9 +175,9 @@ impl Toolbox {
             ToolDeclaration::new(
                 TOOL_SET_THEME,
                 format!(
-                    "Choose the theme the nacelle desktop draws itself with, by setting Theme= \
-                     in the user's nacelle-desktop.conf. Call {TOOL_LIST_THEMES} first if the \
-                     user named a theme you have not seen. {TAKES_EFFECT}"
+                    "Choose the theme the nacelle desktop draws itself with, by setting the \
+                     theme in the user's nacelle-desktop.ron. Call {TOOL_LIST_THEMES} first if \
+                     the user named a theme you have not seen. {TAKES_EFFECT}"
                 ),
                 one_string(
                     "name",
@@ -207,8 +209,8 @@ impl Toolbox {
                 TOOL_SET_LAYAUT,
                 format!(
                     "Choose the layaut the nacelle desktop arranges its panels with, by setting \
-                     Layaut= in the user's nacelle-desktop.conf. Only a layaut that is installed \
-                     may be chosen. {TAKES_EFFECT}"
+                     the layaut in the user's nacelle-desktop.ron. Only a layaut that is \
+                     installed may be chosen. {TAKES_EFFECT}"
                 ),
                 one_string(
                     "name",
@@ -239,7 +241,7 @@ impl Toolbox {
             ToolDeclaration::new(
                 TOOL_SET_CONFIG,
                 format!(
-                    "Set one key in the user's nacelle-desktop.conf. Only the keys \
+                    "Set one key in the user's nacelle-desktop.ron. Only the keys \
                      nacelle_read_config lists may be set, and only to a value of the shape it \
                      gives; anything else is refused and nothing is written. The theme and the \
                      layaut have tools of their own ({TOOL_SET_THEME}, {TOOL_SET_LAYAUT}) which \
@@ -256,9 +258,11 @@ impl Toolbox {
                         },
                         "value": {
                             "type": ["string", "number", "boolean"],
-                            "description": "The new value. An empty string clears the key, \
-                                            which the desktop reads as an explicit \"no value\" \
-                                            and which overrides any system-wide default."
+                            "description": "The new value. An empty string clears the key: for \
+                                            most keys the setting is removed so the system \
+                                            defaults answer again; for ColorLut and ColorIcc it \
+                                            is stored as an explicit \"none\" that overrides \
+                                            any system-wide default."
                         }
                     },
                     "required": ["key", "value"],
@@ -445,21 +449,28 @@ impl Toolbox {
     }
 
     fn read_config(&self) -> Result<Value, ToolError> {
-        let files = self.dirs.conf_files();
-        let settings = conf::effective(&self.guard, &files);
-        Ok(json!({
+        let levels = self.dirs.conf_levels();
+        let effective = conf::effective(&self.guard, &levels);
+        let mut result = json!({
             "user_file": self.dirs.user_conf().ok().as_deref().map(path),
-            "files": files
+            "files": levels
                 .iter()
-                .map(|f| json!({ "path": path(f), "exists": f.is_file() }))
+                .flat_map(|l| {
+                    [
+                        json!({ "path": path(&l.ron), "format": "ron",
+                                "exists": l.ron.is_file() }),
+                        json!({ "path": path(&l.legacy), "format": "key=value (read-only)",
+                                "exists": l.legacy.is_file() }),
+                    ]
+                })
                 .collect::<Vec<_>>(),
-            "settings": settings
+            "settings": effective
+                .settings
                 .iter()
                 .map(|s| json!({
                     "key": s.key,
                     "value": s.value,
                     "from": path(&s.from),
-                    "known": conf::key(&s.key).is_some(),
                 }))
                 .collect::<Vec<_>>(),
             "keys": KEYS
@@ -470,10 +481,19 @@ impl Toolbox {
                     "summary": k.summary,
                 }))
                 .collect::<Vec<_>>(),
-            "note": "A setting marked \"known\": false is in the file but is not one this agent \
-                     may write — nacelle-desktop ignores keys it does not know. Values are \
-                     read as a cascade: the user's file first, then the system ones, key by key.",
-        }))
+            "note": "The configuration is RON (nacelle-desktop.ron), read as a cascade: the \
+                     user's file first, then the system ones, setting by setting. A directory \
+                     with no .ron is answered by its old Key=Value file, which is read but \
+                     never written. An empty value means an explicit \"none\".",
+        });
+        if !effective.problems.is_empty() {
+            insert(
+                &mut result,
+                "problems",
+                json!(effective.problems),
+            );
+        }
+        Ok(result)
     }
 
     fn set_config(&self, input: &Value) -> Result<Value, ToolError> {
@@ -493,7 +513,8 @@ impl Toolbox {
 
     /// The effective value of one configuration key.
     fn setting(&self, key: &str) -> Option<Setting> {
-        conf::effective(&self.guard, &self.dirs.conf_files())
+        conf::effective(&self.guard, &self.dirs.conf_levels())
+            .settings
             .into_iter()
             .find(|s| s.key == key)
     }

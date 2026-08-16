@@ -34,6 +34,8 @@ const LEGACY_APP: &str = "nacelle-desktop";
 /// The configuration file is named after the PROGRAM, so it did not
 /// change with the folder.
 const CONF: &str = "nacelle-desktop.conf";
+/// Its RON successor — read first, and the only one ever written.
+const CONF_RON: &str = "nacelle-desktop.ron";
 
 /// A fresh directory for one test. The counter keeps parallel tests
 /// from colliding without needing a lock.
@@ -77,6 +79,11 @@ impl Install {
         self.config.join(CONF)
     }
 
+    /// The RON document — the only file a write may produce.
+    fn conf_ron(&self) -> PathBuf {
+        self.config.join(CONF_RON)
+    }
+
     fn write_conf(&self, body: &str) {
         fs::write(self.conf(), body).expect("write conf");
     }
@@ -112,6 +119,16 @@ fn conf_value(path: &Path, key: &str) -> Option<String> {
         .filter(|(k, _)| k.trim() == key)
         .map(|(_, v)| v.trim().to_string())
         .next_back()
+}
+
+/// What a written RON document says about one key, read back through
+/// the same parser the tools use — `None` when it says nothing and the
+/// cascade would answer.
+fn ron_value(path: &Path, key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let doc = nacelle_ai::tools::conf::parse_ron(&text)
+        .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+    nacelle_ai::tools::conf::field_value(&doc, key)
 }
 
 // ---- the declarations ---------------------------------------------
@@ -200,10 +217,23 @@ fn choosing_a_theme_writes_the_key_and_keeps_the_rest_of_the_file() {
     assert_eq!(out["previous"], "crimson");
     assert!(out.get("warning").is_none(), "aurora is installed");
 
-    let text = fs::read_to_string(install.conf()).expect("read back");
-    assert!(text.contains("# mine"), "comments survive: {text}");
-    assert!(text.contains("SoundVolume=40"), "other keys survive: {text}");
-    assert_eq!(conf_value(&install.conf(), "Theme").as_deref(), Some("aurora"));
+    // The write goes to the RON document, SEEDED from the old file so
+    // nothing the user had set is lost — and the old file itself stays
+    // byte for byte as it was.
+    assert_eq!(
+        ron_value(&install.conf_ron(), "Theme").as_deref(),
+        Some("aurora")
+    );
+    assert_eq!(
+        ron_value(&install.conf_ron(), "SoundVolume").as_deref(),
+        Some("40"),
+        "the first write carries the old file's other settings across"
+    );
+    assert_eq!(
+        fs::read_to_string(install.conf()).expect("old file"),
+        "# mine\nSoundVolume=40\nTheme=crimson\n",
+        "the Key=Value file is read, never written"
+    );
 }
 
 /// A theme that is not a file may still be one of the toolkit's own, so
@@ -225,7 +255,7 @@ fn choosing_a_theme_with_no_file_warns_but_still_writes() {
         "{out}"
     );
     assert_eq!(
-        conf_value(&install.conf(), "Theme").as_deref(),
+        ron_value(&install.conf_ron(), "Theme").as_deref(),
         Some("lockdown")
     );
 }
@@ -343,20 +373,32 @@ fn choosing_an_installed_layaut_writes_the_key() {
     assert_eq!(out["value"], "narrow");
     assert_eq!(out["previous"], Value::Null);
     assert_eq!(
-        conf_value(&install.conf(), "Layaut").as_deref(),
+        ron_value(&install.conf_ron(), "Layaut").as_deref(),
         Some("narrow")
     );
 }
 
-/// Clearing is a real operation: `Layaut=` means "the built-in one",
-/// and it has to beat a system file that names another.
+/// Clearing is a real operation: an empty name REMOVES the field, so
+/// the rest of the cascade answers again — and the user's old file,
+/// which still says `Layaut=wide`, is outranked by the new document
+/// standing beside it.
 #[test]
 fn an_empty_name_clears_the_layaut_setting() {
     let install = install("clear-layaut");
     install.write_conf("Layaut=wide\n");
     let out = run(&install.toolbox(), TOOL_SET_LAYAUT, json!({ "name": "" }));
     assert_eq!(out["value"], "");
-    assert_eq!(conf_value(&install.conf(), "Layaut").as_deref(), Some(""));
+    assert!(install.conf_ron().is_file(), "the cleared document is written");
+    assert_eq!(
+        ron_value(&install.conf_ron(), "Layaut"),
+        None,
+        "cleared means the field is gone, not an empty name"
+    );
+    assert_eq!(
+        conf_value(&install.conf(), "Layaut").as_deref(),
+        Some("wide"),
+        "the old file is read, never written"
+    );
 }
 
 // ---- addons --------------------------------------------------------
@@ -421,14 +463,20 @@ fn the_configuration_is_read_with_the_file_each_value_came_from() {
     install.write_conf("# comment\nTheme=crimson\nSoundVolume=40\nMystery=42\n");
 
     let out = run(&install.toolbox(), TOOL_READ_CONFIG, json!({}));
-    assert_eq!(out["user_file"], install.conf().display().to_string());
+    assert_eq!(
+        out["user_file"],
+        install.conf_ron().display().to_string(),
+        "the file a tool may write is the RON document"
+    );
     let settings = out["settings"].as_array().expect("an array");
-    assert_eq!(names(&out["settings"], "key"), ["Mystery", "SoundVolume", "Theme"]);
+    // `Mystery` is not a setting the desktop reads, so the typed
+    // document has nowhere to put it and the report does not invent a
+    // place. The values that ARE settings come from the old file, and
+    // the report says so.
+    assert_eq!(names(&out["settings"], "key"), ["SoundVolume", "Theme"]);
     for s in settings {
         assert_eq!(s["from"], install.conf().display().to_string());
     }
-    assert_eq!(settings[0]["known"], false, "Mystery is not a key we write");
-    assert_eq!(settings[2]["known"], true);
 
     let keys = names(&out["keys"], "key");
     for expected in ["Theme", "Layaut", "SoundVolume", "GridCols"] {
@@ -445,12 +493,34 @@ fn one_key_is_set_and_the_previous_value_reported() {
         TOOL_SET_CONFIG,
         json!({ "key": "SoundVolume", "value": "75" }),
     );
-    assert_eq!(out["previous"], "40");
+    assert_eq!(out["previous"], "40", "the old file's value is the previous one");
     assert_eq!(out["value"], "75");
-    assert_eq!(out["backup"], format!("{}.bak", install.conf().display()));
+    assert_eq!(
+        out["backup"],
+        Value::Null,
+        "the first write creates the RON document; there is nothing of it to back up"
+    );
+    assert_eq!(
+        ron_value(&install.conf_ron(), "SoundVolume").as_deref(),
+        Some("75")
+    );
+
+    // The second write replaces the document this program wrote, and
+    // THAT is backed up beside it.
+    let out = run(
+        &install.toolbox(),
+        TOOL_SET_CONFIG,
+        json!({ "key": "SoundVolume", "value": "60" }),
+    );
+    assert_eq!(out["previous"], "75");
+    assert_eq!(
+        out["backup"],
+        format!("{}.bak", install.conf_ron().display())
+    );
     assert_eq!(
         conf_value(&install.conf(), "SoundVolume").as_deref(),
-        Some("75")
+        Some("40"),
+        "the old file keeps saying what it always said"
     );
 }
 
@@ -471,11 +541,11 @@ fn a_number_or_a_boolean_argument_is_accepted() {
         json!({ "key": "SoundTyping", "value": false }),
     );
     assert_eq!(
-        conf_value(&install.conf(), "SoundVolume").as_deref(),
+        ron_value(&install.conf_ron(), "SoundVolume").as_deref(),
         Some("75")
     );
     assert_eq!(
-        conf_value(&install.conf(), "SoundTyping").as_deref(),
+        ron_value(&install.conf_ron(), "SoundTyping").as_deref(),
         Some("0")
     );
 }
@@ -536,7 +606,7 @@ fn a_word_value_is_stored_the_way_the_desktop_reads_it() {
         json!({ "key": "ColorSpace", "value": "Display P3" }),
     );
     assert_eq!(
-        conf_value(&install.conf(), "ColorSpace").as_deref(),
+        ron_value(&install.conf_ron(), "ColorSpace").as_deref(),
         Some("display p3")
     );
 }
@@ -696,8 +766,8 @@ fn the_new_folder_wins_over_the_old_one_and_both_over_the_system() {
     );
     assert_eq!(
         out["user_file"],
-        new.join(CONF).display().to_string(),
-        "the file a tool may write is the new one, whatever exists beside it"
+        new.join(CONF_RON).display().to_string(),
+        "the file a tool may write is the new folder's RON document, whatever exists beside it"
     );
 }
 
@@ -753,9 +823,14 @@ fn a_write_lands_in_the_new_folder_and_the_old_file_is_untouched() {
     let tools = Toolbox::from_env(&env_at(&root));
     run(&tools, TOOL_SET_THEME, json!({ "name": "azure" }));
 
-    let new = root.join("config").join(APP).join(CONF);
+    let new = root.join("config").join(APP).join(CONF_RON);
     assert!(new.is_file(), "the write must land in the new folder");
-    assert!(fs::read_to_string(&new).expect("new conf").contains("Theme=azure"));
+    assert_eq!(ron_value(&new, "Theme").as_deref(), Some("azure"));
+    assert_eq!(
+        ron_value(&new, "Sounds").as_deref(),
+        Some("classic"),
+        "the new document is seeded from the old folder's file, so nothing is lost"
+    );
     assert_eq!(
         fs::read_to_string(old.join(CONF)).expect("old conf"),
         before,
@@ -798,14 +873,35 @@ fn with_only_home_set_both_folder_names_stand_under_dot_config() {
         .collect();
     let dirs = DesktopDirs::from_env(&env);
     let config = root.join(".config");
+    let levels = dirs.conf_levels();
     assert_eq!(
-        dirs.conf_files(),
+        levels.iter().map(|l| l.dir.clone()).collect::<Vec<_>>(),
         vec![
-            config.join(APP).join(CONF),
-            config.join(LEGACY_APP).join(CONF),
-            PathBuf::from("/etc/xdg").join(APP).join(CONF),
-            PathBuf::from("/etc/xdg").join(LEGACY_APP).join(CONF),
+            config.join(APP),
+            config.join(LEGACY_APP),
+            PathBuf::from("/etc/xdg").join(APP),
+            PathBuf::from("/etc/xdg").join(LEGACY_APP),
         ]
+    );
+    for level in &levels {
+        assert_eq!(
+            level.ron,
+            level.dir.join(CONF_RON),
+            "every rung reads the RON document first"
+        );
+        assert_eq!(
+            level.legacy,
+            level.dir.join(CONF),
+            "and falls back to the old Key=Value file beside it"
+        );
+    }
+    assert_eq!(
+        dirs.user_conf_levels()
+            .iter()
+            .map(|l| l.dir.clone())
+            .collect::<Vec<_>>(),
+        vec![config.join(APP), config.join(LEGACY_APP)],
+        "only the user's own rungs may seed a write"
     );
     assert_eq!(
         dirs.config_dir().expect("HOME is set"),

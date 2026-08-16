@@ -37,6 +37,22 @@ repository = "https://github.com/JOCKER3201/nacelle-ai"
 # serde_json is MIT OR Apache-2.0, as is everything it pulls in.
 serde_json = "1"
 
+# The configuration format. The owner's decision of 2026-08-12 (see
+# `.gap-program/decyzja-konfiguracja-ron.md`) puts the whole nacelle
+# family's configuration in RON — `nacelle/nacelle-desktop.ron` — and
+# the desktop's reader derives its parser from a typed model, so this
+# workspace does the same rather than growing a second grammar for the
+# same file. ron is MIT OR Apache-2.0 and was audited with that
+# decision; 0.10.0 is yanked, which is why the floor is 0.12.
+ron = "0.12"
+
+# serde's derive feature is the price of the typed model above: the
+# desktop and this agent must agree byte for byte about what the file
+# means, and two hand-written parsers is how they come to disagree.
+# The proc-macro chain it drags in (serde_derive, syn, quote,
+# proc-macro2, unicode-ident) is MIT OR Apache-2.0 throughout.
+serde = { version = "1", features = ["derive"] }
+
 # ureq is the HTTP client. It blocks by design, which is why this
 # workspace can use it at all — see the no-runtime rule above. Ollama is
 # reached over plain HTTP; Anthropic needs TLS, and the feature set

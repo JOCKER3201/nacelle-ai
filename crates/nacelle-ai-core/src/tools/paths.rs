@@ -44,9 +44,14 @@ pub const APP: &str = "nacelle";
 /// everything installed there goes on being found one place further
 /// down the search path.
 pub const LEGACY_APP: &str = "nacelle-desktop";
-/// The one configuration file, in every configuration directory. Named
+/// The configuration document, in every configuration directory. Named
 /// after the PROGRAM whose settings it carries, which is why it does
-/// not change with the folder.
+/// not change with the folder. RON, per the owner's decision of
+/// 2026-08-12 — see `.gap-program/decyzja-konfiguracja-ron.md`.
+pub const CONF_RON: &str = "nacelle-desktop.ron";
+/// The same configuration in the format that came before it. Read
+/// where no `.ron` stands beside it, never written: a machine that had
+/// settings before the change keeps exactly the file it had.
 pub const CONF_FILE: &str = "nacelle-desktop.conf";
 
 /// Layout files, `<name>.layaut`.
@@ -71,11 +76,29 @@ const DEFAULT_CONFIG_DIRS: &str = "/etc/xdg";
 const DEFAULT_DATA_DIRS: &str = "/usr/local/share:/usr/share";
 const SYSTEM_THEME_BASE: &str = "/usr/share";
 
+/// One rung of the configuration cascade: a directory, the RON
+/// document in it, and the `Key=Value` file that came before it. The
+/// legacy file is consulted only where no `.ron` stands beside it —
+/// per DIRECTORY, so the two formats can stand on different rungs of
+/// the same cascade.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfLevel {
+    pub dir: PathBuf,
+    pub ron: PathBuf,
+    pub legacy: PathBuf,
+}
+
 /// Every directory a tool may read from, and the one it may write to.
 #[derive(Clone, Debug)]
 pub struct DesktopDirs {
     config_dir: Option<PathBuf>,
     config_dirs: Vec<PathBuf>,
+    /// How many of the leading entries of `config_dirs` are the USER's
+    /// own — the ones a write may seed its document from. A value that
+    /// came from `/etc/xdg` must stay a system value, or the first
+    /// setting anybody changed would freeze that day's defaults into
+    /// their home directory forever.
+    user_levels: usize,
     data_dirs: Vec<PathBuf>,
     theme_dirs: Vec<PathBuf>,
 }
@@ -93,6 +116,9 @@ impl DesktopDirs {
             non_blank(env.var(ENV_XDG_CONFIG_DIRS)),
             DEFAULT_CONFIG_DIRS,
         );
+        // The user's base contributes the leading pair — the family
+        // folder and the folder's old name — and nothing else does.
+        let user_levels = if config_home.is_some() { 2 } else { 0 };
         let data_dirs = search_path(
             data_home.clone(),
             non_blank(env.var(ENV_XDG_DATA_DIRS)),
@@ -129,6 +155,7 @@ impl DesktopDirs {
         DesktopDirs {
             config_dir,
             config_dirs,
+            user_levels,
             data_dirs,
             theme_dirs,
         }
@@ -143,6 +170,7 @@ impl DesktopDirs {
     /// say about where it keeps things.
     pub fn new(config_dir: Option<PathBuf>, data_dir: Option<PathBuf>) -> Self {
         let config_dirs: Vec<PathBuf> = config_dir.clone().into_iter().collect();
+        let user_levels = config_dirs.len();
         let data_dirs: Vec<PathBuf> = data_dir.clone().into_iter().collect();
         let mut theme_dirs = Vec::new();
         for dir in [data_dir, config_dir.clone()].into_iter().flatten() {
@@ -151,6 +179,7 @@ impl DesktopDirs {
         DesktopDirs {
             config_dir,
             config_dirs,
+            user_levels,
             data_dirs,
             theme_dirs,
         }
@@ -163,18 +192,33 @@ impl DesktopDirs {
             .ok_or(ToolError::NoConfigDir)
     }
 
-    /// Every `nacelle-desktop.conf` that takes part, most specific
-    /// first. Files that do not exist are included: which of them is
-    /// missing is part of the answer to "where does this value come
-    /// from".
-    pub fn conf_files(&self) -> Vec<PathBuf> {
-        self.config_dirs.iter().map(|d| d.join(CONF_FILE)).collect()
+    /// Every rung of the configuration cascade, most specific first.
+    /// Files that do not exist are included: which of them is missing
+    /// is part of the answer to "where does this value come from".
+    pub fn conf_levels(&self) -> Vec<ConfLevel> {
+        self.config_dirs
+            .iter()
+            .map(|d| ConfLevel {
+                dir: d.clone(),
+                ron: d.join(CONF_RON),
+                legacy: d.join(CONF_FILE),
+            })
+            .collect()
     }
 
-    /// The user's own `nacelle-desktop.conf` — the only one a tool may
-    /// write. The system copies belong to the package manager.
+    /// The leading rungs of [`DesktopDirs::conf_levels`] that are the
+    /// user's own — the ones a write may seed its document from.
+    pub fn user_conf_levels(&self) -> Vec<ConfLevel> {
+        let mut levels = self.conf_levels();
+        levels.truncate(self.user_levels);
+        levels
+    }
+
+    /// The user's own `nacelle-desktop.ron` — the only file a tool may
+    /// write. The system copies belong to the package manager, and the
+    /// old `Key=Value` file is read, never written.
     pub fn user_conf(&self) -> Result<PathBuf, ToolError> {
-        Ok(self.config_dir()?.join(CONF_FILE))
+        Ok(self.config_dir()?.join(CONF_RON))
     }
 
     /// Sub-directories named `sub` that exist, in search order.

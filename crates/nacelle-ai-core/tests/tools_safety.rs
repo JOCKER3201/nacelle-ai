@@ -32,6 +32,9 @@ use serde_json::json;
 /// name, which is why only one of these two reads "desktop".
 const APP: &str = "nacelle";
 const CONF: &str = "nacelle-desktop.conf";
+/// The RON document — the only file a write may produce. The old
+/// `Key=Value` file is read, never written.
+const CONF_RON: &str = "nacelle-desktop.ron";
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -70,6 +73,10 @@ impl Install {
 
     fn conf(&self) -> PathBuf {
         self.config.join(CONF)
+    }
+
+    fn conf_ron(&self) -> PathBuf {
+        self.config.join(CONF_RON)
     }
 
     /// Something worth stealing, outside both directories.
@@ -278,23 +285,28 @@ fn a_refused_call_leaves_the_file_and_the_directory_exactly_as_they_were() {
 #[test]
 fn an_overwrite_keeps_the_previous_contents_in_a_backup() {
     let install = install("backup");
-    let before = "Theme=crimson\n";
-    fs::write(install.conf(), before).expect("conf");
+    install
+        .toolbox()
+        .run(TOOL_SET_THEME, &json!({ "name": "crimson" }))
+        .expect("the first write must succeed");
+    let before = fs::read_to_string(install.conf_ron()).expect("the first document");
 
     install
         .toolbox()
         .run(TOOL_SET_THEME, &json!({ "name": "aurora" }))
         .expect("the write must succeed");
 
-    let backup = install.config.join(format!("{CONF}.bak"));
+    let backup = install.config.join(format!("{CONF_RON}.bak"));
     assert_eq!(fs::read_to_string(&backup).expect("a backup"), before);
-    assert_eq!(
-        fs::read_to_string(install.conf()).expect("read back"),
-        "Theme=aurora\n"
+    assert!(
+        fs::read_to_string(install.conf_ron())
+            .expect("read back")
+            .contains("aurora"),
+        "the document now names the new theme"
     );
     assert_eq!(
         entries(&install.config),
-        vec![CONF.to_string(), format!("{CONF}.bak")],
+        vec![CONF_RON.to_string(), format!("{CONF_RON}.bak")],
         "the temporary file must not survive the rename"
     );
 }
@@ -311,30 +323,36 @@ fn a_first_write_reports_no_backup() {
     let out: serde_json::Value = serde_json::from_str(&text).expect("JSON");
     assert_eq!(out["backup"], serde_json::Value::Null);
     assert_eq!(out["previous"], serde_json::Value::Null);
-    assert_eq!(entries(&install.config), vec![CONF.to_string()]);
+    assert_eq!(entries(&install.config), vec![CONF_RON.to_string()]);
 }
 
-/// A file that declares the same key twice must not be left declaring
-/// two different values: the desktop reads the last one, so a rewrite
-/// of only the first would produce a file that says one thing and means
-/// another.
+/// An old file that declares the same key twice must not confuse the
+/// write: the desktop's old reader took the LAST declaration, so the
+/// seed does too, and the document written says exactly one thing.
 #[test]
 fn a_key_declared_twice_is_left_saying_one_thing() {
     let install = install("duplicate");
-    fs::write(
-        install.conf(),
-        "Theme=crimson\nSoundVolume=40\nTheme=lockdown\n",
-    )
-    .expect("conf");
+    let before = "Theme=crimson\nSoundVolume=40\nTheme=lockdown\n";
+    fs::write(install.conf(), before).expect("conf");
 
-    install
+    let text = install
         .toolbox()
         .run(TOOL_SET_THEME, &json!({ "name": "aurora" }))
         .expect("the write must succeed");
+    let out: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(
+        out["previous"], "lockdown",
+        "the last declaration is the one the desktop read, so it is the previous value"
+    );
 
-    let text = fs::read_to_string(install.conf()).expect("read back");
-    assert_eq!(text.matches("Theme=aurora").count(), 2, "{text}");
-    assert!(!text.contains("crimson") && !text.contains("lockdown"), "{text}");
+    let doc = fs::read_to_string(install.conf_ron()).expect("read back");
+    assert_eq!(doc.matches("aurora").count(), 1, "{doc}");
+    assert!(!doc.contains("crimson") && !doc.contains("lockdown"), "{doc}");
+    assert_eq!(
+        fs::read_to_string(install.conf()).expect("old file"),
+        before,
+        "the old file is read, never rewritten — duplicates and all"
+    );
 }
 
 // ---- atomicity -----------------------------------------------------
