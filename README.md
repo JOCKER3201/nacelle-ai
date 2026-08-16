@@ -1,8 +1,8 @@
 # nacelle-ai
 
 The AI agent for the [nacelle](https://github.com/JOCKER3201/nacelle-desktop)
-environment — an agent that can read the machine it runs on, use tools,
-and answer in the desktop's own vocabulary.
+environment — a **daemon** that can read the machine it runs on, use
+tools, and answer in the desktop's own vocabulary.
 
 > **THIS PROJECT IS WRITTEN WITH THE HELP OF AI (Anthropic's Claude
 > models). Every line of code here was produced in collaboration with an
@@ -12,28 +12,132 @@ and answer in the desktop's own vocabulary.
 
 ## Status: early
 
-Very early. `nacelle-ai` opens a window, picks a backend, and holds a
-streamed conversation with tools and an approval step. The widget half
-does not exist yet. Nothing here is stable — the crate layout, the
-contracts and the configuration format may all still change.
+Very early. `nacelle-ai` is a daemon: it listens on a Unix socket,
+answers a small JSON Lines protocol, and holds streamed conversations
+with tools and an approval step. Nothing here is stable — the crate
+layout, the contracts and the configuration format may all still change.
 
-## Two modes
+## A daemon, not a window
 
-The same agent, in two shapes, from one core:
+The window is gone — the owner's decision of 2026-08-16. What used to
+be drawn in a window of its own is now four widgets in nacelle-addons
+(media looping, photo work, file sorting, chat), and this program is
+the process they all talk to. **There are no graphics here at all**: no
+toolkit, no renderer, no winit — the whole dependency tree of the
+window went with it.
 
-* **Standalone** — its own process and its own window, built on
-  [libnacelle](https://github.com/JOCKER3201/libnacelle). See below.
-* **Widget** — loaded by nacelle-desktop and drawn as a panel among the
-  others. Not written yet.
+Two rules govern the daemon, and both are the owner's:
 
-Everything that is not about being a process lives in `nacelle-ai-core`,
-so neither mode has an implementation the other lacks. The core draws
-nothing and knows nothing about windows.
+* **Nothing without a command.** The daemon takes no action of its own
+  initiative — no timers, no watchers, no autonomous work. The core's
+  background `Watch` exists and stays unplugged. The accept loop waits,
+  a connection waits, and the first byte of work happens because a
+  command arrived on the socket. A test holds a live daemon open and
+  measures that nothing happens.
+* **The local model manages the interface, and nothing else.** Ollama
+  runs in exactly two places: an `ask` whose backend is `auto` — the
+  daemon's own agent, whose tools are the nacelle configuration tools —
+  and an `ask` whose backend is `local`, chat the client pinned to this
+  machine explicitly, per command. It is never handed the user's files
+  to process: the media tools involve no model of any kind, and there
+  is no path from a `tool` command to one.
 
-It also has no async runtime and never will: the desktop owns a
-synchronous event loop, so the agent runs on a worker thread and hands
-results back over a `std::sync::mpsc` channel. A dependency that drags
-in a reactor cannot be used here.
+Everything that is not about being a process lives in `nacelle-ai-core`.
+The core draws nothing, knows nothing about windows, and knows nothing
+about sockets either; the daemon crate is the door — a socket, a
+protocol, and the policy above.
+
+It also has no async runtime and never will: everything blocks, the
+agent runs on a worker thread, and results travel over
+`std::sync::mpsc` channels. A dependency that drags in a reactor cannot
+be used here.
+
+## The socket
+
+```
+$XDG_RUNTIME_DIR/nacelle/ai.sock      directory 0700, socket 0600
+/tmp/nacelle-$UID/ai.sock             when XDG_RUNTIME_DIR is unset
+```
+
+The permissions are the boundary: everything crossing this socket is
+the owner's conversation with their own machine, and they are set
+unconditionally — even on a directory that already existed. A socket
+file left behind by a killed daemon is swept and rebound; a socket a
+*live* daemon answers on makes a second daemon refuse to start.
+
+```
+nacelle-ai [--backend auto|claude|local] [--model <id>]
+```
+
+`--backend` sets what an `ask` that says `auto` resolves to. The
+default leaves `auto` as the local model with the desktop's own
+configuration tools. `claude` sends those asks to Claude instead —
+behind the manifest, as always. `local` **pins** the daemon: nothing
+goes off this machine, and a command asking for claude is refused with
+the pin, not with a missing token. An ask that names its own backend
+always wins over the flag. `--model` picks the model; unasked, the
+backend's own default answers (the first model the local server
+reports, or `claude-opus-4-8`).
+
+## Protocol v0 — JSON Lines
+
+One JSON object per line, both directions. Commands, client → daemon:
+
+```
+{"cmd":"hello","client":"<name>","proto":0}
+{"cmd":"ask","id":N,"text":"...","backend":"claude"|"local"|"auto"}
+{"cmd":"tool","id":N,"tool":"loop"|"photo"|"sort","args":{...}}
+{"cmd":"approve","id":N,"allow":true|false}
+{"cmd":"cancel","id":N}
+```
+
+Events, daemon → client:
+
+```
+{"ev":"hello","proto":0,"backends":[...]}
+{"ev":"delta","id":N,"text":"..."}       {"ev":"done","id":N,...}
+{"ev":"approval","id":N,"desc":"..."}    (waits for cmd:approve)
+{"ev":"progress","id":N,"msg":"..."}     {"ev":"error","id":N,"msg":"..."}
+```
+
+Every `ask` and every `tool` ends in exactly one `done` or `error`
+carrying its id; a cancellation is a `done` with `"cancelled": true` in
+the extras. `done` may carry more fields than `id` — a client keys on
+`ev` and `id`, so the tail is free to grow. A connection runs one
+command at a time; a second `ask` or `tool` sent while one runs is
+answered with an error rather than queued silently. The widgets each
+hold a connection of their own.
+
+**Approvals ride the wire.** A change the agent wants to make and a
+payload about to leave the machine both arrive as `ev:approval` and
+wait for `cmd:approve` — per action, every time. There is no "allow
+all": the protocol cannot say it and the daemon does not invent it. An
+approval the client never answers — the widget died, the connection
+closed — is a **refusal**, by construction.
+
+## The tools
+
+`cmd:tool` is the deterministic half of the daemon: no model is
+involved on this path at all.
+
+* **`loop`** — media in, a loop out, ffmpeg **by exec**. A video
+  becomes a seamless loop: its own opening seconds are cross-faded over
+  its ending (v0 drops the audio track rather than pretending an audio
+  splice is seamless). One or more photos become a one-minute clip that
+  cycles through them, made to be played on repeat. The result is
+  always a **new** file beside the source — `<stem>-loop.<ext>`,
+  counted up until a free name is found, with ffmpeg's own `-n` as the
+  second lock. Nothing overwrites the input. When ffmpeg is not
+  installed the answer is an error that says so and what to do;
+  `NACELLE_AI_FFMPEG` points at a private build.
+* **`photo`**, **`sort`** — named in the protocol, not built yet. The
+  skeleton takes the command and answers `error: not built yet`, which
+  is all it may honestly do.
+
+Running ffmpeg is deliberate and stays within this project's licence
+rules: executing somebody else's program is fine; copying or
+translating its code is forbidden. Everything here builds argument
+lists and reads exit codes.
 
 ## Two backends
 
@@ -195,13 +299,22 @@ must never do is tell you the screen has already changed.
 | tool | what it does |
 |---|---|
 | `nacelle_list_themes` | the installed `.theme` files, and which one is selected |
-| `nacelle_set_theme` | sets `Theme=` |
+| `nacelle_set_theme` | sets the theme in `nacelle-desktop.ron` |
 | `nacelle_list_layauts` | the installed layauts, and which one is selected |
 | `nacelle_read_layaut` | one layaut file, as text |
-| `nacelle_set_layaut` | sets `Layaut=`, and only to a layaut that is installed |
+| `nacelle_set_layaut` | sets the layaut, and only to a layaut that is installed |
 | `nacelle_list_addons` | the installed scripts and plugins, and what each declares about itself |
 | `nacelle_read_config` | every setting in force, the file it came from, and the keys that may be set |
-| `nacelle_set_config` | sets one key in `nacelle-desktop.conf` |
+| `nacelle_set_config` | sets one key in `nacelle-desktop.ron` |
+
+The configuration the tools edit is **RON** —
+`nacelle/nacelle-desktop.ron`, per the owner's decision — read and
+written through the same typed model the desktop derives its parser
+from, so the two programs agree byte for byte about what the file
+means. A directory that still has only the old `Key=Value`
+`nacelle-desktop.conf` is read through it, and never written: a
+machine that had settings before the change keeps exactly the file it
+had, and the first write puts a `.ron` beside it.
 
 A listing covers installed FILES. The toolkit carries themes compiled
 into it and the desktop links some widgets straight into its binary;
@@ -415,68 +528,23 @@ stopped from the interface, and it says which it is: a background process
 that reads your files and can be neither seen nor stopped is not a
 feature.
 
-## The window
+## Who answers an ask
 
-```
-nacelle-ai [--backend auto|claude|local] [--model <id>]
-```
+`auto` is the daemon's own agent: the local model with the nacelle
+configuration tools, whether or not a credential resolves. Claude is
+not the first responder and does not run unasked — a token being
+present does not make it one.
 
-`auto` is the local model, whether or not a credential resolves. Claude
-is not the first responder and does not run unasked: it is reached when
-something makes it necessary — you asking, the same task failing twice,
-work that does not fit the local context, a capability the local model
-has not got, or the local model asking with a reason you can read — and
-you see exactly what would leave the machine before it does.
-
-`claude` is you asking, in as many words, and it is honoured from the
-first turn. `local` pins the session: nothing goes off the machine, and
-the agent says what it cannot do instead of reaching for the network. A
-machine with no token and a machine with no network degrade to exactly
-that pin, because the local half must never depend on the remote half
-being reachable.
+`claude` is the client asking, in as many words, and it is honoured
+from the first command — behind the manifest, which arrives on the
+connection as `ev:approval` and goes nowhere until `cmd:approve` says
+so. `local` is chat pinned to this machine, explicitly, per command.
 
 Naming a provider uses that one or says why it cannot — asking for
 Claude and silently getting a model on your own machine would answer a
-different question than the one asked.
-
-Enter sends. Escape stops an answer that is arriving, and answers a
-waiting change: while the agent is holding a change for approval, Enter
-and Escape belong to that question and every other key still edits the
-field, because a person may well type their next question while they
-think about the one on screen.
-
-The reply grows as it streams. The agent loop blocks on a worker thread
-and reports over a channel; a relay thread hands each event to winit's
-own queue, so the window sleeps until something happens instead of
-polling for it, and every fragment of the reply is a wake-up.
-
-Five states are **shown** rather than left to be inferred, each saying
-what to do about it: no local model, no Anthropic credential, a refusal
-from the model, a cancellation, and the turn ceiling. Which provider is
-answering is on screen permanently, because it is a fact about the
-conversation and not about one turn.
-
-This is the first program outside nacelle-desktop built on the toolkit,
-and that is the point of it: the window is winit and a Vulkan surface
-through [nacelle-renderer](https://github.com/JOCKER3201/nacelle-renderer),
-and everything above that — the theme engine and its master
-`default.theme`, the scrolling row list the conversation is drawn as, the
-text input with its caret, selection and undo — comes from libnacelle
-with nothing copied out of the desktop. **Every colour, length and
-duration on screen comes from a theme token, including as a fallback:
-what the theme does not say, this program does not draw.**
-
-Three numbers in `window.rs` are not tokens, and each says why in a
-comment. The size the window first asks the window manager for, because
-the theme describes what is inside a window and has nothing to say about
-how large one should open — everything drawn within it is derived from
-the window's actual size, so it decides nothing but the first frame. The
-pace of a frame while something is still moving, which is a clock rather
-than a look. And the distance under which the view still counts as being
-at the bottom, which is arithmetic: a difference below one device pixel
-cannot be seen, and if it counted as "the reader scrolled away" a reply
-would stop following its own tail over a rounding error. All three are
-tokens the master could grow — see the handover notes.
+different question than the one asked. A daemon started with
+`--backend local` refuses claude asks with the pin, not with a missing
+token.
 
 ## Build
 
@@ -484,6 +552,12 @@ tokens the master could grow — see the handover notes.
 cargo build
 cargo test
 ```
+
+The interface that draws the daemon's answers lives in
+[nacelle-addons](https://github.com/JOCKER3201/nacelle-addons): four
+widgets on the desktop's upper board, each holding a connection of its
+own. This repository builds one binary, `nacelle-ai`, and it opens no
+window.
 
 ## Licence
 
