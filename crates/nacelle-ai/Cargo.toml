@@ -1,6 +1,6 @@
 [package]
 name = "nacelle-ai"
-description = "The nacelle AI agent running on its own, as a program rather than a desktop widget"
+description = "The nacelle AI agent as a daemon: a Unix socket, the v0 JSON Lines protocol, and nothing done unasked"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,31 +8,23 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# The daemon's logic lives in a library so the tests can drive it over a
+# pair of connected streams without a listening socket. The name differs
+# from the package because the CORE's library is already `nacelle_ai`.
+[lib]
+name = "nacelle_ai_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nacelle-ai"
 path = "src/main.rs"
 
 [dependencies]
-# The agent itself: credentials, the backends, the tools and the loop.
-# Nothing in this crate re-implements any of it — see the module header
-# in src/main.rs for the line between the two.
+# The agent itself: credentials, the backends, the tools, the loop, the
+# confidentiality line. Nothing in this crate re-implements any of it —
+# this crate is the DOOR: a socket, a protocol, and the policy that the
+# daemon does nothing without a command.
 nacelle-ai-core = { workspace = true }
 
-# The toolkit. The theme engine and its master `default.theme`, the
-# model/view core the conversation scrolls on, and the text input the
-# question is typed into. The crate is `libnacelle`, the name in code is
-# `nacelle::`.
-libnacelle = { workspace = true }
-
-# The frames. Everything above hands it one vertex stream per frame.
-nacelle-renderer = { workspace = true }
-
-# The window and its events.
-winit = { workspace = true }
-
-[dev-dependencies]
-# Tool arguments are JSON on every provider, so a test that builds a tool
-# call has to build one. Nothing outside the tests reaches for it — the
-# window shows a call's arguments as the text the core already made of
-# them — which is why it is here and not above.
+# The protocol is JSON Lines, one object per line, both directions.
 serde_json = { workspace = true }

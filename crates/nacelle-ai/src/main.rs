@@ -1,55 +1,41 @@
-//! Standalone mode: the agent as its own program, in a window of its
-//! own.
+//! The nacelle AI daemon: parse the command line, open the socket,
+//! serve connections. Everything else lives in the library —
+//! [`nacelle_ai_daemon`] — where the tests can reach it.
 //!
-//! The same core runs inside nacelle-desktop as a widget, so everything
-//! that is not about being a process lives in `nacelle-ai-core` and
-//! nothing here may grow a second implementation of it. What belongs
-//! here is what a widget gets from its host instead: the process
-//! environment, the arguments, the exit code — and, since this is the
-//! standalone mode, the window.
-//!
-//! | module | what it is |
-//! |---|---|
-//! | [`choice`] | which of the two providers answers, and why the other cannot |
-//! | [`conversation`] | the column of turns, and the rows it is drawn as |
-//! | [`keys`] | who a keystroke belongs to and what it means |
-//! | [`window`] | winit, Vulkan through nacelle-renderer, and one frame |
-//!
-//! The window is built entirely on **libnacelle** — the same toolkit
-//! nacelle-desktop is built on, taken from its own repository and not
-//! from a copy of the desktop. The theme engine and its master
-//! `default.theme` decide every colour, length and duration on screen;
-//! the model/view core owns the scrolling; the text input owns the
-//! caret, the selection and the undo stack. Nothing here has a colour or
-//! a spacing of its own, including as a fallback: what the theme does
-//! not say, this program does not draw.
-
-mod choice;
-mod conversation;
-mod keys;
-#[cfg(test)]
-mod paper;
-mod window;
+//! There is no window here and there will not be one: the owner's
+//! decision of 2026-08-16 (`.gap-program/decyzja-nacelle-ai-daemon.md`)
+//! made this program a daemon, and the widgets that draw its answers
+//! live in nacelle-addons. The daemon does NOTHING without a command
+//! from the socket — no timers, no watchers; the core's `Watch` stays
+//! unplugged.
 
 use std::process::ExitCode;
+use std::thread;
 
 use nacelle_ai::credentials::ProcessEnv;
-use nacelle_ai::{Agent, Toolbox, Worker};
-
-use crate::choice::Want;
+use nacelle_ai::Toolbox;
+use nacelle_ai_daemon::proto::Wanted;
+use nacelle_ai_daemon::{backends, serve, socket};
 
 const USAGE: &str = "\
-nacelle-ai — the nacelle agent, in a window of its own
+nacelle-ai — the nacelle agent, as a daemon
 
     nacelle-ai [--backend auto|claude|local] [--model <id>]
 
-    --backend   which provider answers. `auto` (the default) is the
-                local model, whether or not a credential resolves —
-                Claude is asked only when something needs it, and you
-                see exactly what would leave this machine first.
-                `claude` is you asking for it in as many words.
-                `local` pins the session: nothing goes off the machine
-                and the agent says what it cannot do instead.
+The daemon listens on a Unix socket and does nothing without a command
+arriving on it. The socket is $XDG_RUNTIME_DIR/nacelle/ai.sock
+(directory 0700, socket 0600), or /tmp/nacelle-$UID/ai.sock when
+XDG_RUNTIME_DIR is unset. The protocol is v0 JSON Lines — see the
+README.
+
+    --backend   what an ask that says `auto` resolves to. `auto` (the
+                default) is the local model with the desktop's own
+                configuration tools — interface management, which is
+                all the local model is for. `claude` sends those asks
+                to Claude instead, behind the manifest. `local` PINS
+                the daemon: nothing goes off this machine, and asking
+                for claude is refused with the pin.
+                An ask that names its own backend always wins.
     --model     which model to ask for. Defaults to the backend's own
                 default: the first model the local server reports, or
                 claude-opus-4-8.
@@ -61,7 +47,7 @@ looked for; it is never printed, logged, or written into an error.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut want = Want::Auto;
+    let mut want = Wanted::Auto;
     let mut model: Option<String> = None;
 
     let mut i = 0;
@@ -79,7 +65,7 @@ fn main() -> ExitCode {
                 let Some(name) = args.get(i + 1) else {
                     return fail("--backend needs a name: auto, claude or local");
                 };
-                let Some(chosen) = choice::want_of(name) else {
+                let Some(chosen) = Wanted::of(name) else {
                     return fail(&format!(
                         "there is no backend called \"{name}\" — it is auto, claude or local"
                     ));
@@ -99,50 +85,45 @@ fn main() -> ExitCode {
         i += 1;
     }
 
-    // Layer 4's line to the screen, made before the choice because the
-    // choice is what puts a seal on the far end of it. It stays silent
-    // for a session that never reaches off this machine, which is every
-    // session that nothing escalates.
-    let (discloser, manifests) = nacelle_ai::over_channel();
-
-    // Who answers. This blocks — it may ask a local server what it has —
-    // and it is done before the window so the first frame already knows
-    // what to say, rather than showing a backend it has not checked.
-    let mut choice = choice::choose(want, model.as_deref(), discloser);
-    let indicator = choice.indicator();
-
-    // The agent, and the thread it lives on. Everything from here is the
-    // core's: the loop, the tools, the approval path, the cancellation.
-    let worker = match choice.backend.take() {
-        Some(backend) => {
-            let tools = Toolbox::from_env(&ProcessEnv);
-            // Said here and only here, which is once per run: the core
-            // is a library and does not print, and this is the one
-            // place the directories are built from the real
-            // environment. A machine from before the folder was named
-            // after the family says nothing at all.
-            for dir in tools.dirs().legacy_dirs_in_use() {
-                eprintln!(
-                    "nacelle-ai: reading {} \u{2014} the folder's old name. Nothing has \
-                     been moved and nothing has to be; its place from now on is {}, one \
-                     folder for the whole nacelle family",
-                    dir.display(),
-                    dir.with_file_name(nacelle_ai::tools::paths::APP).display()
-                );
-            }
-            let agent = Agent::new(backend, Box::new(tools), choice.model.clone());
-            match Worker::spawn(agent) {
-                Ok(pair) => Some(pair),
-                Err(err) => return fail(&format!("cannot start the agent thread: {err}")),
-            }
-        }
-        None => None,
-    };
-
-    match window::run(indicator, choice.notices, worker, manifests) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => fail(&message),
+    // Said here and only here, which is once per run: the core is a
+    // library and does not print, and this is the one place the
+    // directories are built from the real environment. A machine from
+    // before the folder was named after the family says nothing at all.
+    let tools = Toolbox::from_env(&ProcessEnv);
+    for dir in tools.dirs().legacy_dirs_in_use() {
+        eprintln!(
+            "nacelle-ai: reading {} \u{2014} the folder's old name. Nothing has been moved \
+             and nothing has to be; its place from now on is {}, one folder for the whole \
+             nacelle family",
+            dir.display(),
+            dir.with_file_name(nacelle_ai::tools::paths::APP).display()
+        );
     }
+    drop(tools);
+
+    let (listener, path) = match socket::listen_from_env(&|name| std::env::var(name).ok()) {
+        Ok(bound) => bound,
+        Err(msg) => return fail(&msg),
+    };
+    eprintln!("nacelle-ai: listening on {}", path.display());
+
+    // The accept loop: wait, serve, wait. Each connection gets a thread
+    // and a world of its own — sessions are per connection, so two
+    // widgets never share a conversation by accident.
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let Ok(reader) = stream.try_clone() else {
+            continue;
+        };
+        let model = model.clone();
+        let _ = thread::Builder::new()
+            .name("nacelle-ai-conn".to_string())
+            .spawn(move || {
+                let mut world = backends::Real::new(want, model);
+                serve::run(reader, stream, &mut world);
+            });
+    }
+    ExitCode::SUCCESS
 }
 
 fn fail(message: &str) -> ExitCode {
