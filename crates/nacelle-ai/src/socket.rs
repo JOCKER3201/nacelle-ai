@@ -75,7 +75,48 @@ pub fn listen(dir: &Path) -> Result<(UnixListener, PathBuf), String> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot make {} private: {e}", dir.display()))?;
 
-    let path = dir.join(SOCKET_NAME);
+    bind(&dir.join(SOCKET_NAME))
+}
+
+/// Listen on a socket the CONFIGURATION named, rather than on the one
+/// this program places itself.
+///
+/// The difference from [`listen`] is what happens to the directory, and
+/// it is deliberate: [`listen`] owns `<runtime>/nacelle` and sets it
+/// `0700` every time, because it made it and nothing else lives there.
+/// A directory somebody named in `nacelle-ai.ron` is THEIRS — it may be
+/// shared, it may be a place with other things in it — and a daemon
+/// that quietly took `/tmp` down to `0700` on the way past would break
+/// the machine to tighten itself. So the directory must already exist,
+/// its mode is left exactly as it is, and the `0600` on the socket
+/// itself is unchanged.
+///
+/// A named socket in a directory others can enter is therefore a
+/// weaker position than the standard place, and knowingly so: the file
+/// is still the user's alone, but its NAME is visible. The socket's own
+/// security — who may connect and what they may then command — is the
+/// owner's deferred pass, not this function's.
+pub fn listen_named(path: &Path) -> Result<(UnixListener, PathBuf), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("{} is not a place a socket can go", path.display()))?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "{} names a socket in {}, which is not a directory \u{2014} this daemon creates the \
+             standard place and no other",
+            path.display(),
+            parent.display()
+        ));
+    }
+    bind(path)
+}
+
+/// Put the socket at `path` and listen on it, sweeping the remains of a
+/// daemon that was killed and refusing to stand where a live one
+/// already answers.
+fn bind(path: &Path) -> Result<(UnixListener, PathBuf), String> {
+    let path = path.to_path_buf();
     if path.symlink_metadata().is_ok() {
         match UnixStream::connect(&path) {
             Ok(_) => {

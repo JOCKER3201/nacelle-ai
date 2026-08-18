@@ -133,6 +133,45 @@ fn a_second_daemon_refuses_to_take_the_same_socket() {
     let _ = std::fs::remove_dir(&dir);
 }
 
+/// A socket named in `nacelle-ai.ron` is bound where it says, and the
+/// difference from the standard place is what happens to the DIRECTORY:
+/// this one is somebody else's, so its mode is left exactly as it was.
+/// A daemon that took a shared directory down to 0700 on its way past
+/// would break the machine in order to tighten itself.
+#[test]
+fn a_named_socket_is_bound_without_touching_the_directorys_mode() {
+    let dir = test_dir("named");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let named = dir.join("elsewhere.sock");
+    let (listener, path) = socket::listen_named(&named).expect("cannot bind the named socket");
+    assert_eq!(path, named);
+
+    let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o755, "the directory is the user's, not ours");
+    let sock_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(sock_mode, 0o600, "the socket is still the owner's alone");
+
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// And a named socket in a directory that is not there is refused with
+/// a sentence, rather than a tree of directories appearing wherever the
+/// file happened to point.
+#[test]
+fn a_named_socket_in_a_directory_that_does_not_exist_is_refused() {
+    let missing = test_dir("nowhere").join("deeper").join("ai.sock");
+    let err = socket::listen_named(&missing).expect_err("there is no such directory");
+    assert!(err.contains("not a directory"), "said: {err}");
+    assert!(
+        !missing.parent().unwrap().exists(),
+        "the refusal made the directory anyway"
+    );
+}
+
 #[test]
 fn a_stale_socket_is_swept_and_the_daemon_starts() {
     let dir = test_dir("stale");

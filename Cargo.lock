@@ -117,6 +117,8 @@ name = "nacelle-ai"
 version = "0.1.0"
 dependencies = [
  "nacelle-ai-core",
+ "ron",
+ "serde",
  "serde_json",
 ]
 

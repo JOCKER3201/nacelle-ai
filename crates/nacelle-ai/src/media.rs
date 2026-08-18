@@ -99,6 +99,40 @@ impl Ffmpeg {
             .to_string())
     }
 
+    /// The ffmpeg to use, given what the environment says and what the
+    /// configuration file said.
+    ///
+    /// The order is the family's: the environment above the file, so a
+    /// variable somebody exported for this run beats a line written
+    /// down months ago; and `PATH` last, which is what happens when
+    /// neither names one. A named program that is not an executable
+    /// file is an ERROR rather than a fall-through to `PATH` — a person
+    /// who named an ffmpeg wants that ffmpeg, and silently running a
+    /// different one answers a different question.
+    pub fn pick(
+        env: &dyn Fn(&str) -> Option<String>,
+        configured: Option<&Path>,
+    ) -> Result<Ffmpeg, String> {
+        if env(FFMPEG_ENV)
+            .filter(|v| !v.trim().is_empty())
+            .is_some()
+        {
+            return Ffmpeg::find(env);
+        }
+        let Some(named) = configured else {
+            return Ffmpeg::find(env);
+        };
+        if is_executable(named) {
+            return Ok(Ffmpeg {
+                program: named.to_path_buf(),
+            });
+        }
+        Err(format!(
+            "nacelle-ai.ron names {} as ffmpeg, which is not an executable file",
+            named.display()
+        ))
+    }
+
     fn run(&self, args: &[String]) -> Result<Output, String> {
         Command::new(&self.program)
             .args(args)
