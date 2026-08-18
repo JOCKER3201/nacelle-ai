@@ -27,6 +27,13 @@
 //! one of `ev:done` or `ev:error` carrying its id. A cancellation is a
 //! `done` with `"cancelled": true` in the extras — the spec leaves
 //! `done`'s tail open, and a client keys on `ev` and `id`.
+//!
+//! **Which version, and which client.** A `hello` is answered by
+//! [`Handshake`], which compares the version the client named against
+//! the ones this daemon speaks and writes the client's own name on
+//! stderr. Both halves used to be missing: the version was parsed and
+//! dropped, and nothing anywhere said which of the four widgets a
+//! connection belonged to.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -39,7 +46,7 @@ use serde_json::json;
 
 use crate::backends::{Session, World};
 use crate::media::{self, Course, Outcome};
-use crate::proto::{Command, Event, Fault, Wanted};
+use crate::proto::{self, Command, Event, Fault, Wanted};
 
 /// How often the pump looks away from the worker's events to poll the
 /// client's commands and layer 4's manifests. Only ticks while a
@@ -53,6 +60,62 @@ const BUSY: &str =
 
 /// Said to an `approve` that nothing is waiting for.
 const NOTHING_WAITING: &str = "nothing is waiting for an approval";
+
+/// What the connection's `hello` settled — the version negotiation, in
+/// one place, because a `hello` can arrive in three: the idle loop, the
+/// pump of a running ask, and the command drain of a running tool.
+///
+/// Until 2026-08-18 the `proto` field was read off the wire and thrown
+/// away, so a client speaking a version this daemon does not know was
+/// answered `{"ev":"hello","proto":0}` and went on to be served as
+/// though the two agreed. Two things follow from taking it seriously:
+/// the refusal names the versions there are, so a client can choose;
+/// and a connection whose client SAID it speaks something else does no
+/// work until it says otherwise.
+///
+/// What this deliberately does not do is require a handshake. A client
+/// that says nothing at all is served, as it always was — v0 has no
+/// required `hello`, the four widgets are written against a page that
+/// does not demand one, and a rule any client can escape by staying
+/// silent is not a rule. The gate is on a client that named a version,
+/// which is a client that told us it will misread the answer.
+#[derive(Default)]
+struct Handshake {
+    /// The version a client named that this daemon does not speak.
+    refused: Option<u64>,
+}
+
+impl Handshake {
+    /// A `hello` off the wire: the event that answers it, and the state
+    /// it leaves behind. `names` is what an accepted hello reports.
+    fn greet(&mut self, client: &str, proto: u64, names: &[String]) -> Event {
+        let who = proto::client_label(client);
+        if proto::speaks(proto) {
+            self.refused = None;
+            // The one line that says which of the four widgets is on the
+            // other end of this connection. The daemon has no window and
+            // no log of its own; stderr belongs to whoever started it.
+            eprintln!("nacelle-ai: {who} connected, protocol {proto}");
+            Event::Hello {
+                backends: names.to_vec(),
+            }
+        } else {
+            self.refused = Some(proto);
+            eprintln!(
+                "nacelle-ai: {who} asked for protocol {proto}, which this daemon does not speak"
+            );
+            Event::Error {
+                id: 0,
+                msg: proto::version_refused(&who, proto),
+            }
+        }
+    }
+
+    /// Why an `ask` or a `tool` cannot run, when it cannot.
+    fn blocked(&self) -> Option<String> {
+        self.refused.map(proto::version_pending)
+    }
+}
 
 /// Serve one client until it hangs up.
 ///
@@ -71,6 +134,7 @@ where
     // The backends list, cached at the last idle `hello` so a `hello`
     // arriving mid-command can be answered without the world.
     let mut names: Vec<String> = Vec::new();
+    let mut hand = Handshake::default();
 
     loop {
         let next = match commands.recv() {
@@ -79,18 +143,29 @@ where
             Err(_) => return,
         };
         let held = match next {
-            Ok(Command::Hello { .. }) => {
-                names = world.backends();
-                say(&mut writer, &Event::Hello {
-                    backends: names.clone(),
-                })
+            Ok(Command::Hello { client, proto }) => {
+                // Asking the world what it can answer with reaches the
+                // machine — a local server, a credential — so it is done
+                // for a hello that is going to be answered with one.
+                if proto::speaks(proto) {
+                    names = world.backends();
+                }
+                let answer = hand.greet(&client, proto, &names);
+                say(&mut writer, &answer)
             }
-            Ok(Command::Ask { id, text, backend }) => {
-                ask(&mut writer, &commands, world, &mut sessions, &names, id, text, backend)
-            }
-            Ok(Command::Tool { id, tool, args }) => {
-                tool_run(&mut writer, &commands, world, &names, id, &tool, &args)
-            }
+            Ok(Command::Ask { id, text, backend }) => match hand.blocked() {
+                Some(msg) => say(&mut writer, &Event::Error { id, msg }),
+                None => ask(
+                    &mut writer, &commands, world, &mut sessions, &names, &mut hand, id, text,
+                    backend,
+                ),
+            },
+            Ok(Command::Tool { id, tool, args }) => match hand.blocked() {
+                Some(msg) => say(&mut writer, &Event::Error { id, msg }),
+                None => tool_run(
+                    &mut writer, &commands, world, &names, &mut hand, id, &tool, &args,
+                ),
+            },
             Ok(Command::Approve { id, .. }) => say(&mut writer, &Event::Error {
                 id,
                 msg: NOTHING_WAITING.to_string(),
@@ -170,6 +245,7 @@ fn ask<W: Write>(
     world: &mut dyn World,
     sessions: &mut HashMap<&'static str, Session>,
     names: &[String],
+    hand: &mut Handshake,
     id: u64,
     text: String,
     backend: Wanted,
@@ -194,7 +270,7 @@ fn ask<W: Write>(
             return say(writer, &Event::Error { id, msg });
         }
     };
-    pump(writer, commands, session, names, id, turn)
+    pump(writer, commands, session, names, hand, id, turn)
 }
 
 /// What an open `ev:approval` is waiting to hand back.
@@ -236,11 +312,13 @@ fn describe(pending: &PendingApproval) -> String {
 
 /// Drive one `ask` to its end: worker events out as deltas and
 /// progress, approvals held open, commands answered on the way.
+#[allow(clippy::too_many_arguments)]
 fn pump<W: Write>(
     writer: &mut W,
     commands: &Receiver<Result<Command, Fault>>,
     session: &mut Session,
     names: &[String],
+    hand: &mut Handshake,
     id: u64,
     turn: TurnId,
 ) -> io::Result<()> {
@@ -349,9 +427,13 @@ fn pump<W: Write>(
                     }
                 }
                 Ok(Ok(Command::Cancel { .. })) => {}
-                Ok(Ok(Command::Hello { .. })) => say(writer, &Event::Hello {
-                    backends: names.to_vec(),
-                })?,
+                Ok(Ok(Command::Hello { client, proto })) => {
+                    // The cached names, because asking the world again
+                    // mid-turn would reach the machine while a turn is
+                    // running. The negotiation itself is the same one.
+                    let answer = hand.greet(&client, proto, names);
+                    say(writer, &answer)?;
+                }
                 Ok(Ok(Command::Ask { id: to, .. })) | Ok(Ok(Command::Tool { id: to, .. })) => {
                     say(writer, &Event::Error {
                         id: to,
@@ -382,11 +464,13 @@ fn pump<W: Write>(
 
 /// `cmd:tool`: the deterministic tools. No model is involved on this
 /// path — that is the policy, not an accident; see `backends`.
+#[allow(clippy::too_many_arguments)]
 fn tool_run<W: Write>(
     writer: &mut W,
     commands: &Receiver<Result<Command, Fault>>,
     world: &mut dyn World,
     names: &[String],
+    hand: &mut Handshake,
     id: u64,
     tool: &str,
     args: &serde_json::Value,
@@ -401,6 +485,7 @@ fn tool_run<W: Write>(
                 writer,
                 commands,
                 names,
+                hand,
                 id,
                 stopped: false,
                 held: Ok(()),
@@ -441,6 +526,7 @@ struct ConnCourse<'a, W: Write> {
     writer: &'a mut W,
     commands: &'a Receiver<Result<Command, Fault>>,
     names: &'a [String],
+    hand: &'a mut Handshake,
     id: u64,
     stopped: bool,
     /// The first write error, kept so the caller can stop serving a
@@ -476,11 +562,9 @@ impl<W: Write> Course for ConnCourse<'_, W> {
             match self.commands.try_recv() {
                 Ok(Ok(Command::Cancel { id })) if id == self.id => self.stopped = true,
                 Ok(Ok(Command::Cancel { .. })) => {}
-                Ok(Ok(Command::Hello { .. })) => {
-                    let hello = Event::Hello {
-                        backends: self.names.to_vec(),
-                    };
-                    self.tell(&hello);
+                Ok(Ok(Command::Hello { client, proto })) => {
+                    let answer = self.hand.greet(&client, proto, self.names);
+                    self.tell(&answer);
                 }
                 Ok(Ok(Command::Approve { id, .. })) => {
                     let error = Event::Error {

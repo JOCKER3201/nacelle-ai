@@ -19,7 +19,7 @@ use nacelle_ai::message::{Request, ToolCall, ToolDeclaration};
 use nacelle_ai::{Agent, Change, Effect, ToolOutput, ToolRegistry, Worker};
 use nacelle_ai_daemon::backends::{Session, World};
 use nacelle_ai_daemon::media::Ffmpeg;
-use nacelle_ai_daemon::proto::{Command, Event, Wanted, PROTO};
+use nacelle_ai_daemon::proto::{self, Command, Event, Wanted, PROTO};
 use nacelle_ai_daemon::serve;
 use serde_json::{json, Value};
 
@@ -462,6 +462,112 @@ fn an_approve_with_nothing_waiting_is_an_error() {
     let error = client.event();
     assert_eq!(error["ev"], "error");
     assert_eq!(error["id"], 8);
+}
+
+// ------------------------------------------------ the version handshake
+
+/// The daemon used to read `proto` off the wire and throw it away: a
+/// client asking for a version that does not exist was answered
+/// `{"ev":"hello","proto":0}` and served as though the two agreed.
+#[test]
+fn a_hello_naming_a_version_this_daemon_does_not_speak_is_refused() {
+    let mut client = Client::start(TestWorld::empty());
+    client.send(r#"{"cmd":"hello","client":"nacelle-ai-chat","proto":7}"#);
+    let answer = client.event();
+    assert_eq!(answer["ev"], "error", "answered: {answer}");
+    // `hello` carries no id of its own, so the answer carries the id
+    // every id-less answer already uses.
+    assert_eq!(answer["id"], 0);
+    let msg = answer["msg"].as_str().expect("an error says why");
+    // Which client — the whole reason the name is on the wire. Four
+    // widgets hold four connections and the log said nothing about
+    // which of them was which.
+    assert!(msg.contains("nacelle-ai-chat"), "said: {msg}");
+    // And which versions there are, so the client can pick one.
+    assert!(msg.contains(&PROTO.to_string()), "said: {msg}");
+}
+
+/// The refusal is not a formality: a client that told the daemon it
+/// speaks something else does no work until it says otherwise.
+#[test]
+fn a_client_on_a_version_that_was_refused_gets_no_work_done() {
+    let mut client = Client::start(TestWorld::scripted(vec![text_turn(&["hello"])]));
+    client.send(r#"{"cmd":"hello","client":"widget","proto":9}"#);
+    assert_eq!(client.event()["ev"], "error");
+
+    client.send(r#"{"cmd":"ask","id":1,"text":"hi","backend":"local"}"#);
+    let refused = client.beat();
+    assert_eq!(refused["ev"], "error");
+    assert_eq!(refused["id"], 1);
+    assert!(
+        refused["msg"].as_str().unwrap().contains("protocol 9"),
+        "said: {refused}"
+    );
+
+    client.send(r#"{"cmd":"tool","id":2,"tool":"loop","args":{}}"#);
+    let refused = client.beat();
+    assert_eq!(refused["ev"], "error");
+    assert_eq!(refused["id"], 2);
+
+    // Saying hello again with a version the daemon speaks clears it,
+    // and the ask that follows is answered.
+    client.send(r#"{"cmd":"hello","client":"widget","proto":0}"#);
+    assert_eq!(client.event()["ev"], "hello");
+    client.send(r#"{"cmd":"ask","id":3,"text":"hi","backend":"local"}"#);
+    let (done, streamed) = client.finish();
+    assert_eq!(done["ev"], "done", "answered: {done}");
+    assert_eq!(streamed, "hello");
+}
+
+/// A client that never says hello at all is served, exactly as it
+/// always was: v0 has no required handshake, and a gate any client
+/// could escape by staying silent would not be one.
+#[test]
+fn saying_nothing_at_all_is_still_served() {
+    let mut client = Client::start(TestWorld::scripted(vec![text_turn(&["hi"])]));
+    client.send(r#"{"cmd":"ask","id":1,"text":"hi","backend":"local"}"#);
+    let (done, _) = client.finish();
+    assert_eq!(done["ev"], "done", "answered: {done}");
+}
+
+/// A `proto` that is there and is not a version number is a client
+/// meaning something by that field, and guessing at it is what the
+/// handshake exists to stop. A hello with no `proto` at all is a
+/// client from before there was a version to name.
+#[test]
+fn proto_is_a_number_when_it_is_there_and_optional_when_it_is_not() {
+    let fault = Command::parse(r#"{"cmd":"hello","client":"w","proto":"nought"}"#)
+        .expect_err("a version that is not a number is refused");
+    assert!(fault.msg.contains("proto"), "said: {}", fault.msg);
+    assert_eq!(
+        Command::parse(r#"{"cmd":"hello","client":"w"}"#).unwrap(),
+        Command::Hello {
+            client: "w".to_string(),
+            proto: PROTO
+        }
+    );
+}
+
+/// The client's name reaches a log line and an error message, so it is
+/// cut down to something that can sit at the end of a sentence: no
+/// control characters (the log is lines), and a bounded length.
+#[test]
+fn a_client_name_cannot_write_a_line_of_its_own() {
+    let label = proto::client_label("chat\nnacelle-ai: listening on /tmp/evil.sock");
+    assert!(!label.contains('\n'), "label: {label}");
+    assert!(label.contains("chat"), "label: {label}");
+
+    let long = proto::client_label(&"x".repeat(4096));
+    assert!(long.chars().count() <= proto::NAME_MAX + 16, "label: {long}");
+
+    // A right-to-left override is not a control character, and a name
+    // wearing one reorders the rest of the line it lands in.
+    let flipped = proto::client_label("chat\u{202e}gnitsil");
+    assert!(!flipped.contains('\u{202e}'), "label: {flipped}");
+
+    // A client that did not name itself is said to be one, rather than
+    // becoming an empty pair of quotes in the middle of a sentence.
+    assert!(!proto::client_label("   ").contains("\"\""));
 }
 
 // ------------------------------------------------- the shapes themselves
