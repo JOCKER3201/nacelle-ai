@@ -92,11 +92,31 @@ const TAKES_EFFECT: &str = "This edits a file on disk. It does NOT change a desk
 const TAKES_EFFECT_SHORT: &str =
     "saved to the configuration file; nacelle-desktop applies it the next time it starts";
 
-/// What a listing of installed FILES cannot see.
+/// The one theme name that is not a file: the master compiled into the
+/// toolkit. `libnacelle/src/theme/mod.rs` states it — "The master is the
+/// ONE look compiled in; every other theme is a file the person made" —
+/// and the eight shipped variants left on 2026-08-16.
+///
+/// Spelled here rather than asked for, because this program does not link
+/// the toolkit and has no window: it is the one member of the family that
+/// can change the desktop's appearance without seeing a single pixel of
+/// it, which is exactly why its picture of the theme system has to match
+/// the toolkit's.
+const BUILTIN_THEME: &str = "default";
+
+/// What a listing of installed FILES cannot see — stated as ONE theme,
+/// because that is how many there are.
+///
+/// This used to say the toolkit "also carries themes compiled into it",
+/// plural and unnamed, which made every name the listing did not contain
+/// a plausible built-in. A model reading that had no way to tell a theme
+/// that exists from a theme the user misspelled.
 const BUILTIN_THEMES_NOTE: &str =
-    "Only installed .theme files are listed. The toolkit also carries themes compiled into it, \
-     which are not files and cannot be listed here — an active theme that is missing from this \
-     list is most likely one of those.";
+    "Only installed .theme files are listed. The toolkit carries exactly ONE theme compiled \
+     into it, named `default` — the master every other theme inherits from, and the one \
+     nacelle-desktop falls back to. It is not a file and cannot be listed here. An active \
+     theme that is neither `default` nor in this list has no file behind it and is not the \
+     one being drawn.";
 
 const BUILTIN_WIDGETS_NOTE: &str =
     "Only installed addon files are listed. nacelle-desktop also links some widgets straight \
@@ -342,11 +362,18 @@ impl Toolbox {
         let key = conf_key("Theme");
         let change = conf::set(&self.dirs, &self.guard, key, &name)?;
         let mut result = changed(&change);
-        // Not an error: the toolkit carries themes compiled into it, so
-        // a name that is not a file may still be perfectly good. It is
-        // worth saying, because the other possibility is a typo that
-        // will leave the desktop on its default.
+        // Not an error — the write happened and the file is the user's —
+        // but this is the last place the mistake can still be shown
+        // beside the name they typed. A theme name resolves to
+        // `<name>.theme` on the search path or to the one built-in;
+        // anything else leaves the desktop on the master.
+        //
+        // The old wording made a name that is not a file "possibly one of
+        // the themes compiled into the toolkit", so a typo and a working
+        // choice read the same. There is one built-in and it has a name,
+        // so the check can simply ask whether this is it.
         if !change.value.is_empty()
+            && change.value != BUILTIN_THEME
             && !catalog::themes(&self.dirs)
                 .iter()
                 .any(|t| t.name == change.value)
@@ -355,8 +382,9 @@ impl Toolbox {
                 &mut result,
                 "warning",
                 json!(format!(
-                    "no {}.theme is installed; if it is not one of the themes compiled into \
-                     the toolkit, nacelle-desktop will fall back to its built-in theme",
+                    "no {}.theme is installed, and `{BUILTIN_THEME}` is the only theme \
+                     compiled into the toolkit — nacelle-desktop will fall back to that \
+                     built-in theme. Check the spelling against {TOOL_LIST_THEMES}.",
                     change.value
                 )),
             );

@@ -196,9 +196,16 @@ fn themes_are_listed_sorted_with_the_active_one_named() {
     assert_eq!(names(&out["installed"], "name"), ["aurora", "crimson"]);
     assert_eq!(out["active"], "crimson");
     assert_eq!(out["active_from"], install.conf().display().to_string());
+    let note = out["note"].as_str().expect("a note");
     assert!(
-        out["note"].as_str().expect("a note").contains("compiled"),
-        "the listing must admit it cannot see the built-in themes"
+        note.contains("compiled"),
+        "the listing must admit it cannot see the theme the toolkit carries"
+    );
+    assert!(
+        note.contains("ONE") && note.contains("`default`"),
+        "and it must say there is exactly one of them, by name: a note that says \
+         `themes` compiled in, plural and unnamed, makes every misspelling a \
+         plausible built-in — {note}"
     );
 }
 
@@ -236,8 +243,12 @@ fn choosing_a_theme_writes_the_key_and_keeps_the_rest_of_the_file() {
     );
 }
 
-/// A theme that is not a file may still be one of the toolkit's own, so
-/// this is a warning attached to a completed write, not a refusal.
+/// A name with no file behind it is a name the desktop will not draw:
+/// `default` is the ONE theme compiled into the toolkit, so `lockdown`
+/// (a variant that left on 2026-08-16) resolves to nothing. The file is
+/// the user's, so this is a warning attached to a completed write and
+/// not a refusal — but the warning has to say the name is wrong, and
+/// which name would have been right.
 #[test]
 fn choosing_a_theme_with_no_file_warns_but_still_writes() {
     let install = install("set-theme-builtin");
@@ -247,16 +258,40 @@ fn choosing_a_theme_with_no_file_warns_but_still_writes() {
         json!({ "name": "lockdown" }),
     );
     assert_eq!(out["value"], "lockdown");
+    let warning = out["warning"].as_str().expect("a warning").to_string();
+    assert!(warning.contains("compiled into the toolkit"), "{out}");
     assert!(
-        out["warning"]
-            .as_str()
-            .expect("a warning")
-            .contains("compiled into the toolkit"),
-        "{out}"
+        warning.contains("`default`"),
+        "the warning must NAME the one built-in, or a model reading it still \
+         cannot tell a typo from a theme that exists: {out}"
     );
     assert_eq!(
         ron_value(&install.conf_ron(), "Theme").as_deref(),
         Some("lockdown")
+    );
+}
+
+/// And the one name that is not a file and is still right draws no
+/// warning at all. `default` is the master compiled into the toolkit; a
+/// tool that warned about it would be telling the user their working
+/// choice had failed.
+#[test]
+fn choosing_the_built_in_theme_is_not_warned_about() {
+    let install = install("set-theme-default");
+    let out = run(
+        &install.toolbox(),
+        TOOL_SET_THEME,
+        json!({ "name": "default" }),
+    );
+    assert_eq!(out["value"], "default");
+    assert!(
+        out.get("warning").is_none(),
+        "`default` is the theme the toolkit compiles in — there is nothing to warn \
+         about: {out}"
+    );
+    assert_eq!(
+        ron_value(&install.conf_ron(), "Theme").as_deref(),
+        Some("default")
     );
 }
 
