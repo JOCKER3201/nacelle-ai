@@ -27,12 +27,14 @@
 //! daemon hands it [`Real`], and a test hands it scripted sessions with
 //! no network anywhere.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use nacelle_ai::backend::anthropic::{self, Anthropic};
-use nacelle_ai::credentials::{self, ProcessEnv};
-use nacelle_ai::{Agent, AgentEvent, LocalReviewer, Ollama, PendingDisclosure, Policy, Remote,
-                 Seal, Toolbox, Trigger, Worker};
+use nacelle_ai::backend::ollama::HOST_VAR;
+use nacelle_ai::credentials::{self, Env, ProcessEnv};
+use nacelle_ai::{Agent, AgentEvent, Limits, LocalReviewer, Ollama, PendingDisclosure, Policy,
+                 Remote, Seal, Toolbox, Trigger, Worker};
 
 use crate::media::Ffmpeg;
 use crate::proto::Wanted;
@@ -64,17 +66,82 @@ pub trait World {
 /// The real machine: credentials from the process environment, Ollama
 /// over localhost, Anthropic behind the seal.
 pub struct Real {
-    /// The daemon's own default, from the command line: what an `ask`
-    /// that says `auto` resolves to. `local` here is a pin — see
-    /// [`Real::session`].
+    /// The daemon's own default: what an `ask` that says `auto`
+    /// resolves to. `local` here is a pin — see [`Real::session`].
+    /// `--backend`, or `backend:` in `nacelle-ai.ron`.
     want: Wanted,
-    /// `--model`, when given.
+    /// `--model`, or `model:` in the file.
     model: Option<String>,
+    /// `ollama_host:` from the file. `OLLAMA_HOST` outranks it — see
+    /// [`Real::ollama`].
+    host: Option<String>,
+    /// `ffmpeg:` from the file. `NACELLE_AI_FFMPEG` outranks it.
+    ffmpeg: Option<PathBuf>,
+    /// Where the agent loop gives up. The built-in ceiling until the
+    /// file moves it; it was unreachable from anywhere before there was
+    /// a file.
+    limits: Limits,
 }
 
 impl Real {
+    /// The machine with everything at its built-in setting.
     pub fn new(want: Wanted, model: Option<String>) -> Real {
-        Real { want, model }
+        Real {
+            want,
+            model,
+            host: None,
+            ffmpeg: None,
+            limits: Limits::default(),
+        }
+    }
+
+    /// The Ollama server `nacelle-ai.ron` named, if it named one.
+    pub fn with_host(mut self, host: Option<String>) -> Real {
+        self.host = host;
+        self
+    }
+
+    /// The ffmpeg `nacelle-ai.ron` named, if it named one.
+    pub fn with_ffmpeg(mut self, ffmpeg: Option<PathBuf>) -> Real {
+        self.ffmpeg = ffmpeg;
+        self
+    }
+
+    pub fn with_limits(mut self, limits: Limits) -> Real {
+        self.limits = limits;
+        self
+    }
+
+    /// The local server this daemon talks to.
+    fn ollama(&self) -> Ollama {
+        ollama_at(&ProcessEnv, self.host.as_deref())
+    }
+}
+
+/// Which Ollama server is asked, given the environment and what
+/// `nacelle-ai.ron` said.
+///
+/// `OLLAMA_HOST` first, because that is the variable Ollama's own tools
+/// read and a person exports it for a session; then the file; then the
+/// built-in `http://localhost:11434`. The middle of those three is the
+/// new one, and it is deliberately not on top: see the order written
+/// out in [`conf`](crate::conf).
+///
+/// A free function over an injected environment, rather than a method
+/// reading the process's own, because THREE places have to give the
+/// same answer: the session this daemon builds, the line it prints when
+/// it starts, and `--print-config`. Until 2026-08-18 the rule lived
+/// inside [`Real::ollama`] where nothing else could reach it, so the
+/// other two read the file and reported a host the daemon was not
+/// asking — which is the one thing a report about settings must not do.
+pub fn ollama_at(env: &dyn Env, configured: Option<&str>) -> Ollama {
+    let exported = env
+        .var(HOST_VAR)
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
+    match (configured, exported) {
+        (Some(host), false) => Ollama::at(host),
+        _ => Ollama::from_env(env),
     }
 }
 
@@ -87,7 +154,8 @@ impl World for Real {
         let mut names = Vec::new();
         // Local first, because local answers first. Reported only when
         // it could actually answer — a server with a model pulled.
-        if Ollama::from_env(&ProcessEnv)
+        if self
+            .ollama()
             .models()
             .map(|m| !m.is_empty())
             .unwrap_or(false)
@@ -112,24 +180,25 @@ impl World for Real {
         };
         match resolved {
             Wanted::Claude if self.want == Wanted::Local => Err(PINNED.to_string()),
-            Wanted::Claude => claude_session(self.model.as_deref()),
+            Wanted::Claude => claude_session(self.model.as_deref(), self.limits, self.ollama()),
             // `auto` and `local` both run on the local model and both
             // are allowed to — the first is interface management, the
             // second is chat the client chose. They are separate
             // sessions (serve caches by name), so the daemon's own
             // agent and the user's pinned chat do not share a history.
-            Wanted::Auto | Wanted::Local => local_session(self.model.as_deref()),
+            Wanted::Auto | Wanted::Local => {
+                local_session(self.model.as_deref(), self.limits, self.ollama())
+            }
         }
     }
 
     fn ffmpeg(&mut self) -> Result<Ffmpeg, String> {
-        Ffmpeg::find(&|name| std::env::var(name).ok())
+        Ffmpeg::pick(&|name| std::env::var(name).ok(), self.ffmpeg.as_deref())
     }
 }
 
 /// The local model, with the nacelle tools.
-fn local_session(model: Option<&str>) -> Result<Session, String> {
-    let ollama = Ollama::from_env(&ProcessEnv);
+fn local_session(model: Option<&str>, limits: Limits, ollama: Ollama) -> Result<Session, String> {
     let host = ollama.host().to_string();
     let models = ollama
         .models()
@@ -153,11 +222,14 @@ fn local_session(model: Option<&str>) -> Result<Session, String> {
         },
         None => models[0].name.clone(),
     };
-    spawn(Agent::new(
-        Box::new(ollama),
-        Box::new(Toolbox::from_env(&ProcessEnv)),
-        id,
-    ))
+    spawn(
+        Agent::new(
+            Box::new(ollama),
+            Box::new(Toolbox::from_env(&ProcessEnv)),
+            id,
+        )
+        .with_limits(limits),
+    )
     .map(|(worker, events)| Session {
         worker,
         events,
@@ -166,7 +238,7 @@ fn local_session(model: Option<&str>) -> Result<Session, String> {
 }
 
 /// Claude, behind the whole confidentiality line.
-fn claude_session(model: Option<&str>) -> Result<Session, String> {
+fn claude_session(model: Option<&str>, limits: Limits, ollama: Ollama) -> Result<Session, String> {
     let resolved = credentials::resolve(&ProcessEnv).map_err(|e| e.to_string())?;
     let (discloser, manifests) = nacelle_ai::over_channel();
     let mut seal = Seal::new(
@@ -180,15 +252,18 @@ fn claude_session(model: Option<&str>) -> Result<Session, String> {
     // Layer 3, when this machine has a local model to run it. Its
     // absence is a weaker line, not a broken one — the pattern rules
     // still run, and the manifest says which of the two happened.
-    if let Some(reviewer) = layer_three() {
+    if let Some(reviewer) = layer_three(ollama) {
         seal = seal.with_reviewer(reviewer);
     }
     let id = model.unwrap_or(anthropic::DEFAULT_MODEL.id).to_string();
-    spawn(Agent::new(
-        Box::new(Anthropic::new(resolved.credential, seal)),
-        Box::new(Toolbox::from_env(&ProcessEnv)),
-        id,
-    ))
+    spawn(
+        Agent::new(
+            Box::new(Anthropic::new(resolved.credential, seal)),
+            Box::new(Toolbox::from_env(&ProcessEnv)),
+            id,
+        )
+        .with_limits(limits),
+    )
     .map(|(worker, events)| Session {
         worker,
         events,
@@ -200,9 +275,11 @@ fn claude_session(model: Option<&str>) -> Result<Session, String> {
 ///
 /// [`LocalReviewer::new`] refuses anything that is not on the loopback
 /// interface: asking a model on another machine whether a payload may
-/// be sent sends it.
-fn layer_three() -> Option<LocalReviewer> {
-    let ollama = Ollama::from_env(&ProcessEnv);
+/// be sent sends it. That refusal is why a configured `ollama_host`
+/// pointing off this machine costs layer 3 rather than moving it —
+/// unchanged by the configuration file, which only decides WHICH host
+/// is asked, never whether the rule applies.
+fn layer_three(ollama: Ollama) -> Option<LocalReviewer> {
     let name = ollama.models().ok()?.first()?.name.clone();
     LocalReviewer::new(Box::new(ollama), name).ok()
 }
@@ -216,6 +293,50 @@ fn spawn(agent: Agent) -> Result<(Worker, Receiver<AgentEvent>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use nacelle_ai::backend::ollama::DEFAULT_HOST;
+
+    /// An environment that is a table rather than the process's own,
+    /// which is shared, racy under a threaded runner, and would let a
+    /// developer's exported OLLAMA_HOST decide whether a test passes.
+    struct Table(Option<&'static str>);
+
+    impl Env for Table {
+        fn var(&self, key: &str) -> Option<String> {
+            match key == HOST_VAR {
+                true => self.0.map(str::to_string),
+                false => None,
+            }
+        }
+    }
+
+    /// The variable a person exported for this run beats the line
+    /// written down months ago. This is the rung `--print-config` and
+    /// the startup line got wrong while the rule was private.
+    #[test]
+    fn an_exported_host_beats_the_file() {
+        let asked = ollama_at(&Table(Some("http://box:11434")), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://box:11434");
+    }
+
+    #[test]
+    fn the_file_answers_when_nothing_is_exported() {
+        let asked = ollama_at(&Table(None), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://127.0.0.1:59999");
+    }
+
+    /// A variable exported as blank is a variable nobody set — the same
+    /// reading the socket's own placement gives it.
+    #[test]
+    fn a_blank_exported_host_counts_as_unset() {
+        let asked = ollama_at(&Table(Some("   ")), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://127.0.0.1:59999");
+    }
+
+    #[test]
+    fn with_neither_the_built_in_host_answers() {
+        assert_eq!(ollama_at(&Table(None), None).host(), DEFAULT_HOST);
+    }
 
     /// The policy's edge that can be tested without a machine: a pinned
     /// daemon refuses Claude with the pin, not with a missing token.

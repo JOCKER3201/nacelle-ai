@@ -296,6 +296,54 @@ fn an_override_that_is_not_executable_is_named_in_the_error() {
     assert!(err.contains("NACELLE_AI_FFMPEG"), "said: {err}");
 }
 
+/// The order the whole family keeps: the environment above the file.
+/// `NACELLE_AI_FFMPEG` is what somebody exports for one run, and a line
+/// written into `nacelle-ai.ron` months ago must not beat it.
+#[test]
+fn the_environment_outranks_the_file_when_both_name_an_ffmpeg() {
+    let stage = Stage::build("pickorder");
+    let other = stage.file("other-ffmpeg", "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let exported = stage.dir.join("ffmpeg");
+
+    // Both name one: the environment's answer is the one used.
+    let picked = Ffmpeg::pick(
+        &|name| match name {
+            "NACELLE_AI_FFMPEG" => Some(exported.display().to_string()),
+            _ => None,
+        },
+        Some(&other),
+    )
+    .expect("both are executable");
+    assert!(
+        format!("{picked:?}").contains(&exported.display().to_string()),
+        "picked: {picked:?}"
+    );
+
+    // Only the file names one: the file's answer is used, without
+    // PATH being consulted at all.
+    let picked = Ffmpeg::pick(&|_| None, Some(&other)).expect("the file's ffmpeg is executable");
+    assert!(
+        format!("{picked:?}").contains(&other.display().to_string()),
+        "picked: {picked:?}"
+    );
+}
+
+/// A named program that is not an executable is an error, never a
+/// quiet fall-through to whatever `PATH` happens to hold: somebody who
+/// named an ffmpeg wants that one.
+#[test]
+fn an_ffmpeg_named_in_the_file_that_is_not_executable_is_an_error() {
+    let stage = Stage::build("pickplain");
+    let plain = stage.file("not-ffmpeg", "just text");
+    fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let err = Ffmpeg::pick(&|_| None, Some(&plain)).expect_err("a plain file is not an ffmpeg");
+    assert!(err.contains("nacelle-ai.ron"), "said: {err}");
+    assert!(err.contains("not-ffmpeg"), "said: {err}");
+}
+
 #[test]
 fn what_is_not_media_is_refused_before_anything_runs() {
     let stage = Stage::build("notmedia");

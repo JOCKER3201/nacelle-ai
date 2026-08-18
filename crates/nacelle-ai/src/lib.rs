@@ -7,6 +7,7 @@
 //!
 //! | module | what it is |
 //! |---|---|
+//! | [`conf`] | the daemon's own settings: `nacelle-ai.ron`, user over system |
 //! | [`proto`] | protocol v0: the commands and the events, one JSON object per line |
 //! | [`serve`] | one connection: commands in, events out, approvals held open |
 //! | [`socket`] | where the socket lives and who may open it |
@@ -35,6 +36,7 @@
 //! action, no "allow all", and an abandoned question is a refusal.
 
 pub mod backends;
+pub mod conf;
 pub mod media;
 pub mod proto;
 pub mod serve;

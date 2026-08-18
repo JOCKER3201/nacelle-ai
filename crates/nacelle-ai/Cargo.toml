@@ -28,3 +28,10 @@ nacelle-ai-core = { workspace = true }
 
 # The protocol is JSON Lines, one object per line, both directions.
 serde_json = { workspace = true }
+
+# The daemon's own configuration file is RON, read through a typed
+# model, for the same reason the desktop's is: the format is the family's
+# (owner's decision of 2026-08-12) and a hand-written parser is how two
+# readers of one grammar come to disagree. See `conf`.
+ron = { workspace = true }
+serde = { workspace = true }

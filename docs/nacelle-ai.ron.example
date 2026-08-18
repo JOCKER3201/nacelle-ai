@@ -1,0 +1,81 @@
+// nacelle-ai.ron — the daemon's own settings.
+//
+// This file is documentation. Nothing installs it: copy the lines you
+// want into one of the two places below and leave the rest out.
+//
+//     $XDG_CONFIG_HOME/nacelle/nacelle-ai.ron    yours
+//     $XDG_CONFIG_DIRS/nacelle/nacelle-ai.ron    the system's (/etc/xdg)
+//
+// The FOLDER is the family and the FILE is the program: nacelle-ai.ron
+// sits beside nacelle-desktop.ron in one directory, and neither reads
+// the other's.
+//
+// The order, for every setting here:
+//
+//     the command line  >  the environment  >  your file
+//                       >  a system file    >  the built-in default
+//
+// A field that is not written down is answered by the next file down,
+// and finally by this program's own default. That is why CLEARING a
+// setting means DELETING the line rather than emptying it — an empty
+// line is a different sentence. Where a setting has a "none" to say,
+// `Off` says it, and `Off` beats a system file that names something.
+//
+// Everything below is commented out, so this file as it stands says
+// nothing at all — which is exactly what a daemon with no file reads.
+
+(
+    // What an ask that says `auto` resolves to: "auto", "claude" or
+    // "local". `local` PINS the daemon — nothing goes off this machine,
+    // and asking for claude is refused with the pin rather than with a
+    // missing token. There is no Off: `auto` is the neutral answer.
+    //
+    // backend: Named("local"),
+
+    // Which model to ask for. Off means the backend's own default: the
+    // first model the local server reports, or claude-opus-4-8.
+    //
+    // model: Named("qwen3:30b"),
+
+    // The Ollama server, in the shapes OLLAMA_HOST itself takes:
+    // "box:11434", ":11434", or a full URL. OLLAMA_HOST outranks this.
+    //
+    // A host that is not on the loopback interface costs layer 3 of the
+    // confidentiality line: the local reviewer refuses to run anywhere
+    // but on this machine, because asking a model on another machine
+    // whether a payload may be sent has already sent it.
+    //
+    // ollama_host: Named("http://localhost:11434"),
+
+    // Where the socket goes, as the whole path to the socket file.
+    //
+    // Read this before setting it: the widgets compute
+    // $XDG_RUNTIME_DIR/nacelle/ai.sock from the protocol page, so a
+    // daemon listening anywhere else is a daemon they will not find.
+    // The reason to name one is to run a second daemon beside the
+    // first on purpose. The directory must already exist and its
+    // permissions are left exactly as they are — the socket itself is
+    // still 0600.
+    //
+    // socket: Named("/run/user/1000/nacelle/ai-second.sock"),
+
+    // The ffmpeg the `loop` tool execs. Absolute path.
+    // NACELLE_AI_FFMPEG outranks this; with neither, the first
+    // executable `ffmpeg` on PATH answers.
+    //
+    // ffmpeg: Named("/opt/ffmpeg/bin/ffmpeg"),
+
+    // Where the agent loop gives up. Both were constants in the source
+    // until 2026-08-18, reachable from nowhere.
+    //
+    // limits: (
+    //     // How many times the model may come back asking for another
+    //     // tool within one question. Built in: 16. A model handed a
+    //     // tool that keeps failing the same way will keep calling it.
+    //     max_turns: 16,
+    //     // Roughly how many bytes of conversation to keep — about
+    //     // fifty thousand tokens of prose. Built in: 200000. The
+    //     // oldest goes by whole exchanges, never by single messages.
+    //     history_bytes: 200000,
+    // ),
+)
