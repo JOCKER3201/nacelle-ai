@@ -14,7 +14,8 @@ contract the code satisfies today, and the confidentiality line is due its own
 pass — it has been corrected in place, and every part that is still only a
 design is marked:
 
-> **NOT BUILT (design).** …and the file that proves it is not.
+> **NOT BUILT (design).** What was decided, and the file that proves nothing
+> builds it.
 
 Take a marked paragraph as a decision already made about what the thing should
 be, not as a description of what runs. Take everything unmarked as something

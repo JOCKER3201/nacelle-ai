@@ -66,10 +66,38 @@ build:
 
 # The gate this project runs before a commit: a build from nothing and
 # the whole test suite. Named here so it is one word rather than folklore.
+#
+# IT FAILS CLOSED, which `cargo test` on its own does not. A suite that
+# compiled nothing, or that a filter emptied, prints
+#
+#     test result: ok. 0 passed; 0 failed
+#
+# and exits 0 — a green light meaning "nothing was checked". The project
+# rule is exit 0 AND zero failures AND a non-zero number passed, so the
+# count is read back out of the output rather than trusted to the exit
+# code alone. The log is a FILE and not a pipe on purpose: the exit
+# status of a pipeline is the last command's, so `cargo test | tee`
+# reports on tee.
 check:
 	rm -rf target
 	cargo build
-	cargo test --workspace
+	@set -e; \
+	cargo test --workspace --no-fail-fast > target/check.log 2>&1 \
+		|| echo "GATE: cargo test exited non-zero" >> target/check.log; \
+	cat target/check.log; \
+	awk '/^test result:/ { \
+		for (i = 1; i <= NF; i++) { \
+			if ($$(i+1) == "passed;") p += $$i; \
+			if ($$(i+1) == "failed;") f += $$i; \
+		} \
+	} \
+	/^GATE: cargo test exited non-zero/ { broke = 1 } \
+	END { \
+		if (broke) { print "GATE: RED — the run itself failed"; exit 1 } \
+		if (f > 0) { printf "GATE: RED — %d failed\n", f; exit 1 } \
+		if (p == 0) { print "GATE: RED — nothing passed. A suite that ran no test is not a gate"; exit 1 } \
+		printf "GATE: GREEN — %d passed, 0 failed\n", p; \
+	}' target/check.log
 
 install:
 	rm -rf target

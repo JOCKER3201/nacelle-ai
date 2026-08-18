@@ -79,8 +79,9 @@ the pin, not with a missing token. An ask that names its own backend
 always wins over the flag. `--model` picks the model; unasked, the
 backend's own default answers (the first model the local server
 reports, or `claude-opus-4-8`). `--print-config` prints the settings in
-force, the files they came from, and anything wrong with them, then
-stops.
+force — each one with the rung that decided it, whether that was a flag,
+an exported variable or a file — the places it looked, and anything
+wrong with what it found, then stops.
 
 ## Installing it, and who starts it
 

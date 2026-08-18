@@ -26,7 +26,7 @@ use std::thread;
 
 use nacelle_ai::credentials::ProcessEnv;
 use nacelle_ai::Toolbox;
-use nacelle_ai_daemon::conf::{self, Loaded, Settled};
+use nacelle_ai_daemon::conf::{self, Chosen, InForce, Loaded, Settled, Source};
 use nacelle_ai_daemon::proto::Wanted;
 use nacelle_ai_daemon::{backends, serve, socket};
 
@@ -57,8 +57,9 @@ README.
                 here that is missing or broken stops the daemon; one
                 found on the usual search path is reported and skipped.
     --print-config
-                print the configuration in force, and which files it
-                was read from, then stop.
+                print the configuration in force — every setting with
+                the rung that decided it, a flag or a variable or a
+                file — and where it looked, then stop.
     --version   print the version and stop.
     --help      print this and stop.
 
@@ -118,15 +119,23 @@ fn main() -> ExitCode {
     // `--print-config` prints, so a line with a typo in it is answered
     // with the typo rather than with a report of settings that line was
     // never going to run under.
-    let (want, model) = match over(&args, &settled) {
+    let chosen = match over(&args, &settled) {
         Ok(chosen) => chosen,
         Err(msg) => return fail(&msg),
     };
+    // And then the machine, which is the rung above both: an exported
+    // OLLAMA_HOST or NACELLE_AI_FFMPEG beats the file. Asked ONCE here,
+    // so the report and the startup line below say what the accept loop
+    // will actually do rather than what the file alone said.
+    let force = conf::in_force(&ProcessEnv, &settled, &chosen);
     if args.iter().any(|a| a == "--print-config") {
-        print!("{}", conf::report(&loaded, &settled, &places));
+        print!("{}", conf::report(&loaded, &settled, &force, &places));
         return ExitCode::SUCCESS;
     }
-    say_where_from(&loaded, &settled);
+    say_where_from(&loaded, &force);
+    // What every connection below is built on. The same two values the
+    // report just printed, because they are the same two values.
+    let (want, model) = (chosen.backend, chosen.model);
 
     // Said here and only here, which is once per run: the core is a
     // library and does not print, and this is the one place the
@@ -195,9 +204,18 @@ fn named_config(args: &[String]) -> Result<Option<PathBuf>, String> {
 }
 
 /// The command line, laid over what the file settled.
-fn over(args: &[String], settled: &Settled) -> Result<(Wanted, Option<String>), String> {
-    let mut want = settled.backend.unwrap_or_default();
-    let mut model = settled.model.clone();
+///
+/// Reports WHICH of the two answered as well as what: a flag and a file
+/// that both say `claude` are the same daemon and two different things
+/// to go and edit, and `--print-config` is run by somebody who needs to
+/// know which.
+fn over(args: &[String], settled: &Settled) -> Result<Chosen, String> {
+    let mut chosen = Chosen {
+        backend: settled.backend.unwrap_or_default(),
+        backend_from_line: false,
+        model: settled.model.clone(),
+        model_from_line: false,
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -210,47 +228,69 @@ fn over(args: &[String], settled: &Settled) -> Result<(Wanted, Option<String>), 
                 let Some(name) = args.get(i + 1) else {
                     return Err("--backend needs a name: auto, claude or local".to_string());
                 };
-                let Some(chosen) = Wanted::of(name) else {
+                let Some(named) = Wanted::of(name) else {
                     return Err(format!(
                         "there is no backend called \"{name}\" — it is auto, claude or local"
                     ));
                 };
-                want = chosen;
+                chosen.backend = named;
+                chosen.backend_from_line = true;
                 i += 1;
             }
             "--model" => {
                 let Some(id) = args.get(i + 1) else {
                     return Err("--model needs a model id".to_string());
                 };
-                model = Some(id.clone());
+                chosen.model = Some(id.clone());
+                chosen.model_from_line = true;
                 i += 1;
             }
             other => return Err(format!("nothing here takes \"{other}\"\n\n{USAGE}")),
         }
         i += 1;
     }
-    Ok((want, model))
+    Ok(chosen)
 }
 
-/// One line naming the file the settings came from, when any did.
+/// The trace a daemon leaves of which configuration it is running.
 ///
-/// A daemon nobody started by hand leaves no other trace of which
-/// configuration it is running: there is no window, and `--print-config`
-/// is a different process with a possibly different environment.
-fn say_where_from(loaded: &Loaded, settled: &Settled) {
-    let Some(first) = loaded.read.first() else {
-        return;
-    };
-    let rest = loaded.read.len() - 1;
-    let more = match rest {
-        0 => String::new(),
-        1 => " and one below it".to_string(),
-        n => format!(" and {n} below it"),
-    };
-    eprintln!("nacelle-ai: settings from {}{more}", first.display());
-    if let Some(host) = &settled.ollama_host {
-        eprintln!("nacelle-ai: the local model is asked at {host}");
+/// There is no other: no window, and `--print-config` is a different
+/// process with a possibly different environment.
+///
+/// It therefore has to be TRUE, and until 2026-08-18 the host line was
+/// not — it printed what the file said even when an exported
+/// OLLAMA_HOST was what the daemon then asked, which is the one case
+/// the line exists for. It now reads the resolved [`InForce`], the same
+/// value the accept loop runs on, and names the rung that decided.
+fn say_where_from(loaded: &Loaded, force: &InForce) {
+    for line in where_from(loaded, force) {
+        eprintln!("nacelle-ai: {line}");
     }
+}
+
+/// The lines themselves, so a test can read them.
+fn where_from(loaded: &Loaded, force: &InForce) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(first) = loaded.read.first() {
+        let more = match loaded.read.len() - 1 {
+            0 => String::new(),
+            1 => " and one below it".to_string(),
+            n => format!(" and {n} below it"),
+        };
+        out.push(format!("settings from {}{more}", first.display()));
+    }
+    // Said when somebody CHOSE the host, whether in the file or in the
+    // environment. The built-in localhost is not news and is not
+    // printed; a host that came from anywhere else is exactly what a
+    // person reading stderr is trying to find out.
+    if let Some(from) = force.ollama_host.from.filter(|f| *f != Source::BuiltIn) {
+        out.push(format!(
+            "the local model is asked at {} ({})",
+            force.ollama_host.value,
+            from.words()
+        ));
+    }
+    out
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -274,9 +314,10 @@ mod tests {
         let settled = conf::parse("(backend: Named(\"local\"), model: Named(\"llama3\"))")
             .expect("this parses")
             .settle();
-        let (want, model) = over(&args(&[]), &settled).expect("nothing to reject");
-        assert_eq!(want, Wanted::Local);
-        assert_eq!(model.as_deref(), Some("llama3"));
+        let chosen = over(&args(&[]), &settled).expect("nothing to reject");
+        assert_eq!(chosen.backend, Wanted::Local);
+        assert_eq!(chosen.model.as_deref(), Some("llama3"));
+        assert!(!chosen.backend_from_line && !chosen.model_from_line);
     }
 
     /// And the command line is the ceiling.
@@ -285,17 +326,18 @@ mod tests {
         let settled = conf::parse("(backend: Named(\"local\"), model: Named(\"llama3\"))")
             .expect("this parses")
             .settle();
-        let (want, model) = over(&args(&["--backend", "claude", "--model", "opus"]), &settled)
+        let chosen = over(&args(&["--backend", "claude", "--model", "opus"]), &settled)
             .expect("nothing to reject");
-        assert_eq!(want, Wanted::Claude);
-        assert_eq!(model.as_deref(), Some("opus"));
+        assert_eq!(chosen.backend, Wanted::Claude);
+        assert_eq!(chosen.model.as_deref(), Some("opus"));
+        assert!(chosen.backend_from_line && chosen.model_from_line);
     }
 
     #[test]
     fn with_neither_file_nor_flag_the_daemon_is_auto() {
-        let (want, model) = over(&args(&[]), &Settled::default()).expect("nothing to reject");
-        assert_eq!(want, Wanted::Auto);
-        assert_eq!(model, None);
+        let chosen = over(&args(&[]), &Settled::default()).expect("nothing to reject");
+        assert_eq!(chosen.backend, Wanted::Auto);
+        assert_eq!(chosen.model, None);
     }
 
     #[test]
@@ -327,5 +369,76 @@ mod tests {
         assert!(over(&args(&["--eyes"]), &Settled::default()).is_err());
         assert!(over(&args(&["--backend", "gpt"]), &Settled::default()).is_err());
         assert!(over(&args(&["--model"]), &Settled::default()).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // The one trace the daemon leaves on stderr.
+
+    struct Table(&'static [(&'static str, &'static str)]);
+
+    impl nacelle_ai::credentials::Env for Table {
+        fn var(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn forced(env: &Table, text: &str) -> InForce {
+        let settled = conf::parse(text).expect("this parses").settle();
+        let chosen = over(&args(&[]), &settled).expect("nothing to reject");
+        conf::in_force(env, &settled, &chosen)
+    }
+
+    /// The line has to name the host the daemon will ACTUALLY ask.
+    /// It named the file's even when an exported OLLAMA_HOST was what
+    /// the connections then went to — the one case the line exists for.
+    #[test]
+    fn the_startup_line_names_the_host_the_daemon_will_ask() {
+        let exported = Table(&[("OLLAMA_HOST", "http://localhost:11434")]);
+        let force = forced(&exported, "(ollama_host: Named(\"127.0.0.1:59999\"))");
+        let said = where_from(&Loaded::default(), &force).join("\n");
+        assert!(said.contains("http://localhost:11434"), "said: {said}");
+        assert!(said.contains("OLLAMA_HOST"), "said: {said}");
+        assert!(!said.contains("59999"), "said: {said}");
+    }
+
+    #[test]
+    fn the_file_is_named_when_it_is_the_file_that_answered() {
+        let force = forced(&Table(&[]), "(ollama_host: Named(\"127.0.0.1:59999\"))");
+        let said = where_from(&Loaded::default(), &force).join("\n");
+        assert!(said.contains("http://127.0.0.1:59999"), "said: {said}");
+        assert!(said.contains("the file"), "said: {said}");
+    }
+
+    /// A host nobody chose is not news. The built-in localhost says
+    /// nothing about the configuration this daemon is running.
+    #[test]
+    fn nothing_is_said_about_a_host_nobody_chose() {
+        let force = forced(&Table(&[]), "()");
+        assert!(
+            where_from(&Loaded::default(), &force).is_empty(),
+            "said: {:?}",
+            where_from(&Loaded::default(), &force)
+        );
+    }
+
+    #[test]
+    fn the_files_that_were_read_are_counted() {
+        let read = |n: usize| Loaded {
+            read: (0..n).map(|i| PathBuf::from(format!("/f{i}.ron"))).collect(),
+            ..Loaded::default()
+        };
+        let force = forced(&Table(&[]), "()");
+        assert_eq!(where_from(&read(1), &force), ["settings from /f0.ron"]);
+        assert_eq!(
+            where_from(&read(2), &force),
+            ["settings from /f0.ron and one below it"]
+        );
+        assert_eq!(
+            where_from(&read(3), &force),
+            ["settings from /f0.ron and 2 below it"]
+        );
     }
 }

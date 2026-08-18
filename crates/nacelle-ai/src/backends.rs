@@ -113,21 +113,35 @@ impl Real {
     }
 
     /// The local server this daemon talks to.
-    ///
-    /// `OLLAMA_HOST` first, because that is the variable Ollama's own
-    /// tools read and a person exports it for a session; then the
-    /// file; then the built-in `http://localhost:11434`. The middle of
-    /// those three is the new one, and it is deliberately not on top:
-    /// see the order written out in [`conf`](crate::conf).
     fn ollama(&self) -> Ollama {
-        let named = ProcessEnv
-            .var(HOST_VAR)
-            .filter(|v| !v.trim().is_empty())
-            .is_some();
-        match (&self.host, named) {
-            (Some(host), false) => Ollama::at(host),
-            _ => Ollama::from_env(&ProcessEnv),
-        }
+        ollama_at(&ProcessEnv, self.host.as_deref())
+    }
+}
+
+/// Which Ollama server is asked, given the environment and what
+/// `nacelle-ai.ron` said.
+///
+/// `OLLAMA_HOST` first, because that is the variable Ollama's own tools
+/// read and a person exports it for a session; then the file; then the
+/// built-in `http://localhost:11434`. The middle of those three is the
+/// new one, and it is deliberately not on top: see the order written
+/// out in [`conf`](crate::conf).
+///
+/// A free function over an injected environment, rather than a method
+/// reading the process's own, because THREE places have to give the
+/// same answer: the session this daemon builds, the line it prints when
+/// it starts, and `--print-config`. Until 2026-08-18 the rule lived
+/// inside [`Real::ollama`] where nothing else could reach it, so the
+/// other two read the file and reported a host the daemon was not
+/// asking — which is the one thing a report about settings must not do.
+pub fn ollama_at(env: &dyn Env, configured: Option<&str>) -> Ollama {
+    let exported = env
+        .var(HOST_VAR)
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
+    match (configured, exported) {
+        (Some(host), false) => Ollama::at(host),
+        _ => Ollama::from_env(env),
     }
 }
 
@@ -279,6 +293,50 @@ fn spawn(agent: Agent) -> Result<(Worker, Receiver<AgentEvent>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use nacelle_ai::backend::ollama::DEFAULT_HOST;
+
+    /// An environment that is a table rather than the process's own,
+    /// which is shared, racy under a threaded runner, and would let a
+    /// developer's exported OLLAMA_HOST decide whether a test passes.
+    struct Table(Option<&'static str>);
+
+    impl Env for Table {
+        fn var(&self, key: &str) -> Option<String> {
+            match key == HOST_VAR {
+                true => self.0.map(str::to_string),
+                false => None,
+            }
+        }
+    }
+
+    /// The variable a person exported for this run beats the line
+    /// written down months ago. This is the rung `--print-config` and
+    /// the startup line got wrong while the rule was private.
+    #[test]
+    fn an_exported_host_beats_the_file() {
+        let asked = ollama_at(&Table(Some("http://box:11434")), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://box:11434");
+    }
+
+    #[test]
+    fn the_file_answers_when_nothing_is_exported() {
+        let asked = ollama_at(&Table(None), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://127.0.0.1:59999");
+    }
+
+    /// A variable exported as blank is a variable nobody set — the same
+    /// reading the socket's own placement gives it.
+    #[test]
+    fn a_blank_exported_host_counts_as_unset() {
+        let asked = ollama_at(&Table(Some("   ")), Some("127.0.0.1:59999"));
+        assert_eq!(asked.host(), "http://127.0.0.1:59999");
+    }
+
+    #[test]
+    fn with_neither_the_built_in_host_answers() {
+        assert_eq!(ollama_at(&Table(None), None).host(), DEFAULT_HOST);
+    }
 
     /// The policy's edge that can be tested without a machine: a pinned
     /// daemon refuses Claude with the pin, not with a missing token.

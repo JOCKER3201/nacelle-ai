@@ -52,12 +52,14 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use nacelle_ai::backend::ollama;
 use nacelle_ai::credentials::Env;
 use nacelle_ai::tools::model::{Choice, Layered};
 use nacelle_ai::tools::paths::{DesktopDirs, LEGACY_APP};
 use nacelle_ai::Limits;
 use serde::{Deserialize, Serialize};
 
+use crate::media::{self, Ffmpeg};
 use crate::proto::Wanted;
 
 /// The daemon's file, in every configuration directory.
@@ -408,6 +410,204 @@ pub fn load_named(path: &Path) -> Result<Loaded, String> {
     }
 }
 
+/// Which rung of the order decided a value that is in force.
+///
+/// Printed next to the value, because `claude` is a different answer
+/// depending on whether a flag, a variable or a file said it — and the
+/// three are edited in three different places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A flag somebody typed a second ago.
+    Line,
+    /// A variable exported for this run. It carries its own name: "the
+    /// environment" is not somewhere a person can go and look.
+    Env(&'static str),
+    /// One of the files listed above the outcome.
+    File,
+    /// Nobody said anything, so this program's own answer stands.
+    BuiltIn,
+}
+
+impl Source {
+    /// The words `--print-config` puts in the brackets. A variable
+    /// gives its own name, which is the only one of the four somebody
+    /// can act on without reading this program's source.
+    pub fn words(&self) -> &'static str {
+        match self {
+            Source::Line => "the command line",
+            Source::Env(name) => name,
+            Source::File => "the file",
+            Source::BuiltIn => "this program's own",
+        }
+    }
+}
+
+/// One setting as it will actually be used, and which rung settled it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Said {
+    /// What the daemon will use — or, when a rung named something
+    /// unusable, the daemon's own sentence saying so.
+    pub value: String,
+    /// The rung that decided, or `None` when `value` is a complaint
+    /// rather than a value.
+    pub from: Option<Source>,
+}
+
+impl Said {
+    pub fn value(value: impl Into<String>, from: Source) -> Said {
+        Said {
+            value: value.into(),
+            from: Some(from),
+        }
+    }
+
+    /// Something was named and cannot be used. The sentence is the same
+    /// one the client would be shown, not a second wording of it.
+    pub fn wrong(why: impl Into<String>) -> Said {
+        Said {
+            value: why.into(),
+            from: None,
+        }
+    }
+}
+
+/// What the command line settled, and whether the command line is what
+/// settled it.
+///
+/// `conf` cannot parse arguments and must not guess at them, so `main`
+/// hands this in — it is the seam between the two, and the reason
+/// `--print-config` can report a flag at all. Until 2026-08-18 it could
+/// not: the report was handed the file's outcome alone and printed
+/// `auto` at a daemon started with `--backend claude`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chosen {
+    pub backend: Wanted,
+    pub backend_from_line: bool,
+    pub model: Option<String>,
+    pub model_from_line: bool,
+}
+
+/// Everything the daemon settled on: the file, with the command line
+/// over it and the environment where the environment wins.
+///
+/// Built by [`in_force`] from THE SAME functions the daemon runs on —
+/// `backends::ollama_at`, `Ffmpeg::pick`, `socket::place` — rather than
+/// from a second reading of the file. A report that re-derives its
+/// answers is a report that can be right about a program that no longer
+/// exists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InForce {
+    pub backend: Said,
+    pub model: Said,
+    pub ollama_host: Said,
+    pub socket: Said,
+    pub ffmpeg: Said,
+    pub limits: Said,
+}
+
+/// Ask the machine what this daemon is going to run with.
+///
+/// Everything here goes through the daemon's own resolvers, so the two
+/// cannot drift: the host through [`ollama_at`](crate::backends::ollama_at),
+/// which also normalises it and drops a password somebody put in the
+/// URL; ffmpeg through [`Ffmpeg::pick`](crate::media::Ffmpeg::pick),
+/// which is where the environment beats the file; the socket through
+/// [`socket::place`](crate::socket::place), so the report names the path
+/// rather than the phrase "the standard place".
+pub fn in_force(env: &dyn Env, settled: &Settled, chosen: &Chosen) -> InForce {
+    let var = |name: &str| env.var(name);
+
+    let backend = Said::value(
+        format!("{:?}", chosen.backend).to_lowercase(),
+        match (chosen.backend_from_line, settled.backend.is_some()) {
+            (true, _) => Source::Line,
+            (false, true) => Source::File,
+            (false, false) => Source::BuiltIn,
+        },
+    );
+
+    let model = match &chosen.model {
+        Some(id) => Said::value(
+            id.clone(),
+            match chosen.model_from_line {
+                true => Source::Line,
+                false => Source::File,
+            },
+        ),
+        None => Said::value("the backend's default", Source::BuiltIn),
+    };
+
+    let exported_host = env
+        .var(ollama::HOST_VAR)
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
+    let ollama_host = Said::value(
+        crate::backends::ollama_at(env, settled.ollama_host.as_deref())
+            .host()
+            .to_string(),
+        match (exported_host, settled.ollama_host.is_some()) {
+            (true, _) => Source::Env(ollama::HOST_VAR),
+            (false, true) => Source::File,
+            (false, false) => Source::BuiltIn,
+        },
+    );
+
+    let socket = match &settled.socket {
+        Some(path) => Said::value(path.display().to_string(), Source::File),
+        None => match crate::socket::place(&var) {
+            Ok(dir) => Said::value(
+                dir.join(crate::socket::SOCKET_NAME).display().to_string(),
+                match var(crate::socket::RUNTIME_DIR_ENV)
+                    .filter(|v| !v.trim().is_empty())
+                    .is_some()
+                {
+                    true => Source::Env(crate::socket::RUNTIME_DIR_ENV),
+                    false => Source::BuiltIn,
+                },
+            ),
+            Err(why) => Said::wrong(why),
+        },
+    };
+
+    let ffmpeg = match Ffmpeg::pick(&var, settled.ffmpeg.as_deref()) {
+        Ok(found) => Said::value(
+            found.program().display().to_string(),
+            match (
+                var(media::FFMPEG_ENV)
+                    .filter(|v| !v.trim().is_empty())
+                    .is_some(),
+                settled.ffmpeg.is_some(),
+            ) {
+                (true, _) => Source::Env(media::FFMPEG_ENV),
+                (false, true) => Source::File,
+                (false, false) => Source::Env("PATH"),
+            },
+        ),
+        Err(why) => Said::wrong(why),
+    };
+
+    let built_in = Limits::default();
+    let limits = Said::value(
+        format!(
+            "{} turns, {} bytes of history",
+            settled.limits.max_turns, settled.limits.history_bytes
+        ),
+        match settled.limits == built_in {
+            true => Source::BuiltIn,
+            false => Source::File,
+        },
+    );
+
+    InForce {
+        backend,
+        model,
+        ollama_host,
+        socket,
+        ffmpeg,
+        limits,
+    }
+}
+
 /// What `--print-config` writes: where it looked, what the files said,
 /// and what the daemon will actually do with it. A daemon with no window
 /// and no log of its own otherwise has no way to answer "what do you
@@ -417,7 +617,12 @@ pub fn load_named(path: &Path) -> Result<Loaded, String> {
 /// differ exactly where something is wrong — a backend nobody has, a
 /// limit of zero — and printing only the document would hide that,
 /// while printing only the outcome would hide which file to go and fix.
-pub fn report(loaded: &Loaded, settled: &Settled, places: &[PathBuf]) -> String {
+///
+/// The outcome half is [`InForce`] and nothing else. It must not be
+/// re-derived here from `settled`: `settled` is the FILE's answer, and
+/// the two rungs above it — a flag and an exported variable — are
+/// exactly the ones somebody runs this for.
+pub fn report(loaded: &Loaded, settled: &Settled, force: &InForce, places: &[PathBuf]) -> String {
     let mut out = String::new();
     out.push_str("// nacelle-ai, the configuration in force\n");
     out.push_str("//\n// looked in, most specific first:\n");
@@ -430,49 +635,22 @@ pub fn report(loaded: &Loaded, settled: &Settled, places: &[PathBuf]) -> String 
         let _ = writeln!(out, "//   {} \u{2014} {mark}", place.display());
     }
     if loaded.read.is_empty() {
-        out.push_str("//\n// nothing was read: every value below is this program's own.\n");
+        out.push_str("//\n// no file was read: the outcome below is the command line, the \
+                      environment and this program's own answers.\n");
     }
     out.push_str("//\n// what the daemon will do with it:\n");
-    let said = |value: Option<String>, built_in: &str| match value {
-        Some(v) => v,
-        None => format!("{built_in} (this program's own)"),
+    let mut line = |name: &str, said: &Said| {
+        let _ = match &said.from {
+            Some(from) => writeln!(out, "//   {name:<13} {} ({})", said.value, from.words()),
+            None => writeln!(out, "//   {name:<13} ! {}", said.value),
+        };
     };
-    let _ = writeln!(
-        out,
-        "//   backend       {}",
-        said(settled.backend.map(|b| format!("{b:?}").to_lowercase()), "auto")
-    );
-    let _ = writeln!(
-        out,
-        "//   model         {}",
-        said(settled.model.clone(), "the backend's default")
-    );
-    let _ = writeln!(
-        out,
-        "//   ollama host   {}",
-        said(settled.ollama_host.clone(), "OLLAMA_HOST, or localhost:11434")
-    );
-    let _ = writeln!(
-        out,
-        "//   socket        {}",
-        said(
-            settled.socket.as_ref().map(|p| p.display().to_string()),
-            "the standard place"
-        )
-    );
-    let _ = writeln!(
-        out,
-        "//   ffmpeg        {}",
-        said(
-            settled.ffmpeg.as_ref().map(|p| p.display().to_string()),
-            "NACELLE_AI_FFMPEG, or the first on PATH"
-        )
-    );
-    let _ = writeln!(
-        out,
-        "//   limits        {} turns, {} bytes of history",
-        settled.limits.max_turns, settled.limits.history_bytes
-    );
+    line("backend", &force.backend);
+    line("model", &force.model);
+    line("ollama host", &force.ollama_host);
+    line("socket", &force.socket);
+    line("ffmpeg", &force.ffmpeg);
+    line("limits", &force.limits);
     for note in &settled.notes {
         let _ = writeln!(out, "//   ! {note}");
     }
@@ -635,5 +813,198 @@ mod tests {
                 PathBuf::from("/etc/xdg/nacelle/nacelle-ai.ron"),
             ]
         );
+    }
+
+    // -----------------------------------------------------------------
+    // What `--print-config` reports.
+    //
+    // The report had no test at all until 2026-08-18, and it was wrong:
+    // it printed the FILE's answer under a heading that says "what the
+    // daemon will do with it", so a daemon started `--backend claude`
+    // reported `auto` and one running against an exported OLLAMA_HOST
+    // reported the host in the file. Every test below is about a rung
+    // ABOVE the file, because that is the whole of what was missing.
+
+    /// An environment that is a table, so a developer's own exported
+    /// OLLAMA_HOST cannot decide whether these pass.
+    struct Table(&'static [(&'static str, &'static str)]);
+
+    impl Env for Table {
+        fn var(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    fn from_file(text: &str) -> Settled {
+        parse(text).expect("this parses").settle()
+    }
+
+    fn line(text: &str) -> Chosen {
+        let settled = from_file(text);
+        Chosen {
+            backend: settled.backend.unwrap_or_default(),
+            backend_from_line: false,
+            model: settled.model,
+            model_from_line: false,
+        }
+    }
+
+    /// The flag, not the file — the finding this whole section exists
+    /// for. A file saying `local`/`llama3` and a command line saying
+    /// `claude`/`my-model` is a daemon that runs claude/my-model, and
+    /// the report said `local`/`llama3`.
+    #[test]
+    fn the_report_says_what_the_command_line_chose() {
+        let settled = from_file("(backend: Named(\"local\"), model: Named(\"llama3\"))");
+        let chosen = Chosen {
+            backend: Wanted::Claude,
+            backend_from_line: true,
+            model: Some("my-model".to_string()),
+            model_from_line: true,
+        };
+        let force = in_force(&Table(&[]), &settled, &chosen);
+        assert_eq!(force.backend, Said::value("claude", Source::Line));
+        assert_eq!(force.model, Said::value("my-model", Source::Line));
+
+        let printed = report(&Loaded::default(), &settled, &force, &[]);
+        assert!(printed.contains("backend       claude (the command line)"), "{printed}");
+        assert!(printed.contains("model         my-model (the command line)"), "{printed}");
+        assert!(!printed.contains("backend       local"), "{printed}");
+    }
+
+    /// And when no flag was passed, the file gets the credit.
+    #[test]
+    fn the_report_says_which_rung_answered() {
+        let text = "(backend: Named(\"local\"), model: Named(\"llama3\"))";
+        let settled = from_file(text);
+        let force = in_force(&Table(&[]), &settled, &line(text));
+        assert_eq!(force.backend, Said::value("local", Source::File));
+        assert_eq!(force.model, Said::value("llama3", Source::File));
+
+        let bare = in_force(&Table(&[]), &Settled::default(), &line("()"));
+        assert_eq!(bare.backend, Said::value("auto", Source::BuiltIn));
+        assert_eq!(
+            bare.model,
+            Said::value("the backend's default", Source::BuiltIn)
+        );
+    }
+
+    /// The exported variable, not the file. The daemon asks the
+    /// exported host — `backends::ollama_at` is the one rule and this
+    /// goes through it — and the report used to name the other one.
+    #[test]
+    fn the_report_says_the_host_the_daemon_will_ask() {
+        let settled = from_file("(ollama_host: Named(\"127.0.0.1:59999\"))");
+        let exported = Table(&[("OLLAMA_HOST", "http://localhost:11434")]);
+        let force = in_force(&exported, &settled, &line("()"));
+        assert_eq!(
+            force.ollama_host,
+            Said::value("http://localhost:11434", Source::Env("OLLAMA_HOST"))
+        );
+
+        // Nothing exported: the file answers, normalised the way the
+        // request will actually be addressed.
+        let force = in_force(&Table(&[]), &settled, &line("()"));
+        assert_eq!(
+            force.ollama_host,
+            Said::value("http://127.0.0.1:59999", Source::File)
+        );
+    }
+
+    /// Going through the daemon's own resolver has a second effect the
+    /// old report did not have: `normalise_host` drops a password, and
+    /// the report printed the file's string raw.
+    #[test]
+    fn a_password_written_into_the_host_is_not_printed() {
+        let settled = from_file("(ollama_host: Named(\"http://u:hunter2@box:11434\"))");
+        let force = in_force(&Table(&[]), &settled, &line("()"));
+        assert!(!force.ollama_host.value.contains("hunter2"), "{:?}", force.ollama_host);
+        assert!(force.ollama_host.value.contains("box:11434"), "{:?}", force.ollama_host);
+    }
+
+    /// The same order, for the program the `loop` tool execs. Both
+    /// paths here are on every Linux the daemon runs on.
+    #[test]
+    fn the_report_says_the_ffmpeg_the_loop_tool_will_exec() {
+        let settled = from_file("(ffmpeg: Named(\"/bin/cat\"))");
+        let exported = Table(&[("NACELLE_AI_FFMPEG", "/bin/sh")]);
+        assert_eq!(
+            in_force(&exported, &settled, &line("()")).ffmpeg,
+            Said::value("/bin/sh", Source::Env("NACELLE_AI_FFMPEG"))
+        );
+        assert_eq!(
+            in_force(&Table(&[]), &settled, &line("()")).ffmpeg,
+            Said::value("/bin/cat", Source::File)
+        );
+    }
+
+    /// A rung that named something unusable is a complaint, not a
+    /// value, and the report marks it as one. The sentence is the
+    /// daemon's own — the same one the client is shown.
+    #[test]
+    fn an_ffmpeg_that_cannot_be_run_is_reported_as_a_complaint() {
+        let settled = from_file("(ffmpeg: Named(\"/nonexistent/ffmpeg\"))");
+        let force = in_force(&Table(&[("PATH", "")]), &settled, &line("()"));
+        assert_eq!(force.ffmpeg.from, None);
+        assert!(force.ffmpeg.value.contains("not an executable file"), "{:?}", force.ffmpeg);
+        let printed = report(&Loaded::default(), &settled, &force, &[]);
+        assert!(printed.contains("ffmpeg        ! "), "{printed}");
+    }
+
+    #[test]
+    fn with_no_ffmpeg_anywhere_the_report_says_that_rather_than_a_rule() {
+        let force = in_force(&Table(&[("PATH", "")]), &Settled::default(), &line("()"));
+        assert_eq!(force.ffmpeg.from, None);
+        assert!(force.ffmpeg.value.contains("not installed"), "{:?}", force.ffmpeg);
+    }
+
+    /// "the standard place" is not an answer somebody can check against
+    /// the machine in front of them; the path is.
+    #[test]
+    fn the_report_names_the_socket_rather_than_the_phrase() {
+        let session = Table(&[("XDG_RUNTIME_DIR", "/run/user/1000")]);
+        let force = in_force(&session, &Settled::default(), &line("()"));
+        assert_eq!(
+            force.socket,
+            Said::value("/run/user/1000/nacelle/ai.sock", Source::Env("XDG_RUNTIME_DIR"))
+        );
+        let named = from_file("(socket: Named(\"/tmp/two/ai.sock\"))");
+        assert_eq!(
+            in_force(&session, &named, &line("()")).socket,
+            Said::value("/tmp/two/ai.sock", Source::File)
+        );
+    }
+
+    /// The other half of the page is untouched: the document is still
+    /// printed whole, because the outcome alone would hide which file
+    /// to go and edit.
+    #[test]
+    fn the_document_is_still_printed_beside_the_outcome() {
+        let text = "(backend: Named(\"local\"))";
+        let settled = from_file(text);
+        let loaded = assemble(vec![(
+            PathBuf::from("/u/nacelle-ai.ron"),
+            Rung::Text(text.to_string()),
+        )]);
+        let force = in_force(&Table(&[]), &settled, &line(text));
+        let printed = report(&loaded, &settled, &force, &[PathBuf::from("/u/nacelle-ai.ron")]);
+        assert!(printed.contains("/u/nacelle-ai.ron \u{2014} read"), "{printed}");
+        assert!(printed.contains("what the files say:"), "{printed}");
+        assert!(printed.contains("backend: Named(\"local\")"), "{printed}");
+    }
+
+    /// A wrong value in the file still reaches the page, under the
+    /// outcome where it belongs.
+    #[test]
+    fn what_the_file_got_wrong_is_still_said_out_loud() {
+        let settled = from_file("(backend: Named(\"gpt\"))");
+        let force = in_force(&Table(&[]), &settled, &line("(backend: Named(\"gpt\"))"));
+        let printed = report(&Loaded::default(), &settled, &force, &[]);
+        assert!(printed.contains("there is no backend called \"gpt\""), "{printed}");
+        // and the daemon runs auto, which is what the report says.
+        assert_eq!(force.backend, Said::value("auto", Source::BuiltIn));
     }
 }

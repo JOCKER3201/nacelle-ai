@@ -133,6 +133,14 @@ impl Ffmpeg {
         ))
     }
 
+    /// The binary that will actually be exec'd. Named so
+    /// `--print-config` can report the program rather than the rule
+    /// that chose it: "the first on PATH" is not an answer somebody can
+    /// check against the machine in front of them.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
     fn run(&self, args: &[String]) -> Result<Output, String> {
         Command::new(&self.program)
             .args(args)
