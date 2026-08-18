@@ -67,6 +67,7 @@ file left behind by a killed daemon is swept and rebound; a socket a
 
 ```
 nacelle-ai [--backend auto|claude|local] [--model <id>]
+           [--config <file>] [--print-config]
 ```
 
 `--backend` sets what an `ask` that says `auto` resolves to. The
@@ -77,7 +78,90 @@ goes off this machine, and a command asking for claude is refused with
 the pin, not with a missing token. An ask that names its own backend
 always wins over the flag. `--model` picks the model; unasked, the
 backend's own default answers (the first model the local server
-reports, or `claude-opus-4-8`).
+reports, or `claude-opus-4-8`). `--print-config` prints the settings in
+force, the files they came from, and anything wrong with them, then
+stops.
+
+## Installing it, and who starts it
+
+```sh
+make install        # ~/.local/bin/nacelle-ai
+sudo make install   # /usr/local/bin/nacelle-ai
+```
+
+One binary and nothing else: there is no window, so there are no fonts,
+no icons and no menu entry. `make install` does a clean build (the old
+`target` goes first, and again at the end), and warns if the prefix's
+`bin` is not on your `PATH`.
+
+**The desktop starts the daemon, and nothing else does.** Before it
+builds the board, nacelle-desktop connects to
+`$XDG_RUNTIME_DIR/nacelle/ai.sock`; if nothing answers there it spawns
+`nacelle-ai` — the binary named by `NACELLE_AI_BIN`, or the bare name
+looked up on `PATH`. That lookup is what this installer exists to
+satisfy: with no installer there was no `nacelle-ai` on any `PATH`, so
+on an installed system the spawn failed every time and the four AI
+widgets of the upper board stood OFFLINE for good.
+
+There is deliberately no systemd unit and no autostart entry. Two
+starters race for one socket and the loser prints "another nacelle-ai is
+already listening" on every login; and the daemon's only clients are the
+four widgets, so one started at login on a machine without the desktop
+is a process nobody can ask anything. The daemon is not killed when the
+desktop exits — a restarted desktop finds it already answering.
+
+## Its own configuration
+
+```
+$XDG_CONFIG_HOME/nacelle/nacelle-ai.ron      yours
+$XDG_CONFIG_DIRS/nacelle/nacelle-ai.ron      the system's (/etc/xdg)
+```
+
+The FOLDER is the family and the FILE is the program: this sits beside
+`nacelle-desktop.ron` in one directory, and neither reads the other's.
+Nothing installs it, and a daemon that finds none runs on its own
+defaults. `docs/nacelle-ai.ron.example` is a copy with every line
+commented out and each one explained.
+
+The order, for every setting there is:
+
+```
+the command line  >  the environment  >  your file
+                  >  a system file    >  the built-in default
+```
+
+The environment sits above the file because `OLLAMA_HOST` and
+`NACELLE_AI_FFMPEG` are what somebody exports for one run, and a line
+written down months ago must not quietly beat what was typed a second
+ago. The command line sits above both — and the file exists at all
+because the desktop starts this daemon **with no arguments**, so until
+2026-08-18 `--backend` and `--model` were flags nobody on a real machine
+could reach, and the turn ceiling and the history budget were constants
+reachable from nowhere at all.
+
+| field | what it sets |
+|---|---|
+| `backend` | what an `ask` saying `auto` resolves to: `auto`, `claude`, `local` |
+| `model` | which model to ask for |
+| `ollama_host` | the local server, in `OLLAMA_HOST`'s own shapes |
+| `socket` | where the socket goes, whole path — see below |
+| `ffmpeg` | which ffmpeg the `loop` tool execs, absolute path |
+| `limits.max_turns` | how many tool rounds one question may cost (16) |
+| `limits.history_bytes` | roughly how much conversation to keep (200 000) |
+
+A field that is not written down is answered by the next file down, so
+**clearing a setting means deleting the line** rather than emptying it —
+an empty line is a different sentence. Where a setting has a "none" to
+say, `Off` says it, and `Off` beats a system file that names something.
+That is the desktop's own `Choice` model, taken whole rather than
+reinvented.
+
+Two of those deserve a warning. Naming a `socket` moves the daemon away
+from the path the widgets compute from the protocol page, so they will
+not find it — the reason to set it is to run a second daemon beside the
+first on purpose. And an `ollama_host` that is not on the loopback
+interface costs layer 3 of the confidentiality line: the local reviewer
+refuses to run anywhere but on this machine.
 
 ## Protocol v0 — JSON Lines
 
@@ -107,6 +191,19 @@ the extras. `done` may carry more fields than `id` — a client keys on
 command at a time; a second `ask` or `tool` sent while one runs is
 answered with an error rather than queued silently. The widgets each
 hold a connection of their own.
+
+**`hello` is a negotiation, not a greeting.** The version a client names
+in `proto` is checked against the ones this daemon speaks — one, `0`.
+A version it does not speak is answered with `ev:error` (id `0`, which
+is what every id-less answer carries) naming the client and listing the
+versions there are, and until that client says hello again with one of
+them, an `ask` or a `tool` on that connection is refused: a side that
+told us it will misread the answer should not be handed one. A client
+that says nothing at all is served exactly as before — v0 has no
+required handshake and this does not add one, since a rule any client
+could escape by staying silent would not be a rule. The name a client
+gives itself is also the one line of the log that says **which** of the
+four widgets a connection belongs to.
 
 **Approvals ride the wire.** A change the agent wants to make and a
 payload about to leave the machine both arrive as `ev:approval` and
@@ -342,10 +439,13 @@ directory, and no tool runs an addon in order to describe it.
 
 ## The supervisor: what leaves the machine, and when
 
-The local agent (Ollama) is the one with eyes. It runs beside the
-desktop, it can read what you can read, and Claude sees only what it
-decides to send. The design is written out in
-[`docs/supervisor.md`](docs/supervisor.md); what follows is what the code
+The local agent (Ollama) is the one that reads anything at all, and
+Claude sees only what is sent to it. What "reads" means today is
+narrower than the design page once claimed: the tools below are the
+whole of it — the themes, the layauts, the addons and the configuration
+file — and there is no general file-reading tool in this program. The
+design is written out in [`docs/supervisor.md`](docs/supervisor.md),
+which marks what is built and what is not; what follows is what the code
 does.
 
 The obvious way to keep secrets out of a payload — show the text to a
@@ -520,13 +620,13 @@ machine with no network degrade to exactly that** — same code path,
 different sentence — because the local half must never depend on the
 remote half being reachable.
 
-The background watch is event-driven and not a model in a loop. Cheap
-deterministic checks run continuously — a threshold in telemetry the
-desktop already collects, a widget reporting its own anomaly — and
-nothing is interpreted until one of them fires. It can be paused and
-stopped from the interface, and it says which it is: a background process
-that reads your files and can be neither seen nor stopped is not a
-feature.
+**There is no background watch running.** The mechanism exists in the
+core — event-driven, pausable, stoppable, and calling no model of its
+own — and nothing outside its tests constructs one. The daemon leaves it
+unplugged deliberately: the owner's first rule is that nothing happens
+without a command, and a watcher is a thing that happens without one.
+What it would have to look like if it is ever plugged in is in
+[`docs/supervisor.md`](docs/supervisor.md), marked as design.
 
 ## Who answers an ask
 
@@ -551,7 +651,14 @@ token.
 ```sh
 cargo build
 cargo test
+
+make check          # the gate: a build from nothing, then the whole suite
+make install        # a clean build, installed; see "Installing it" above
 ```
+
+`make check` is `rm -rf target` and then both, which is the project's
+rule: a gate that ran against a stale `target` proved something about a
+tree nobody has.
 
 The interface that draws the daemon's answers lives in
 [nacelle-addons](https://github.com/JOCKER3201/nacelle-addons): four
